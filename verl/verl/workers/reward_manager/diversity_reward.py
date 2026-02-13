@@ -339,9 +339,10 @@ class DiversityTTRLRewardManager:
         # consistency_rate: per-sample self-consistency rate (majority_ratio from this prompt group)
         # accuracy_rate: per-sample accuracy rate (correct_count / total from this prompt group)
         all_answer_types = []
+        all_oracle_answer_types = []  # Oracle (true-label based) answer types for advantage bias diagnostics
         all_consistency_rates = []
         all_accuracy_rates = []
-        all_label_accuracies = []  # NEW: Binary indicator of majority vote correctness
+        all_label_accuracies = []  # Binary indicator of majority vote correctness
 
         for prompt_i in range(prompt_num):
             group_pred_outputs = []
@@ -388,35 +389,60 @@ class DiversityTTRLRewardManager:
             # expose diversity metric for this group
             ttrl_metrics["diversity_ratio"] = diversity_ratio
             
-            # === NEW: Extract answer types and consistency rate for this prompt group ===
+            # === Extract answer types, consistency rate, and diagnostic metrics ===
             final_answers = self._extract_final_answers(task, group_pred_outputs)
             freq = Counter(final_answers)
             majority_num = max(freq.values()) if freq else 0
             consistency_rate = majority_num / self.n_votes_per_prompt if self.n_votes_per_prompt > 0 else 0.0
-            
-            # ========== [2026-01-22 MODIFIED] ==========
-            # Use ground_truth_ratio from ttrl_metrics as accuracy rate
-            # instead of calculating from base_rewards
-            # =============================================
             accuracy_rate = ttrl_metrics.get("ground_truth_ratio", 0.0)
-            
-            # ========== [2026-01-24 NEW] ==========
-            # Get label_accuracy (1.0 if majority vote matches ground truth, 0.0 otherwise)
-            # This is used for deterministic advantage estimator selection
-            # ======================================
             label_accuracy = ttrl_metrics.get("label_accuracy", 0.0)
+            
+            # === Compute true_rewards for diagnostic metrics ===
+            # base_rewards: matches majority (pseudo-label), true_rewards: matches ground truth
+            ground_truth = group_labels[0]
+            true_rewards, _ = auto_verify(
+                task, group_pred_outputs, [ground_truth] * len(group_pred_outputs),
+                extra_info=group_extra_info
+            )
+            
+            # false_positive_rate: fraction of pseudo-positive samples that are actually wrong
+            n_pseudo_pos = sum(1 for b in base_rewards if b > 0)
+            n_false_pos = sum(1 for b, t in zip(base_rewards, true_rewards) if b > 0 and t == 0)
+            fp_rate = n_false_pos / n_pseudo_pos if n_pseudo_pos > 0 else 0.0
+            
+            # false_negative_rate: fraction of pseudo-negative samples that are actually correct
+            n_pseudo_neg = sum(1 for b in base_rewards if b == 0)
+            n_false_neg = sum(1 for b, t in zip(base_rewards, true_rewards) if b == 0 and t > 0)
+            fn_rate = n_false_neg / n_pseudo_neg if n_pseudo_neg > 0 else 0.0
+            
+            ttrl_metrics["false_positive_rate"] = fp_rate
+            ttrl_metrics["false_negative_rate"] = fn_rate
             
             # Create answer type mapping (hash of answer string -> integer id)
             answer_to_id = {ans: hash(ans) for ans in set(final_answers)}
             
             for i in range(self.n_votes_per_prompt):
-                # Store answer type id for each sample
-                all_answer_types.append(answer_to_id[final_answers[i]])
-                # Store consistency rate (same for all samples in this prompt group)
+                # --- TTA answer_types (based on pseudo-label / majority voting) ---
+                is_correct = base_rewards[i] > 0
+                if is_correct:
+                    ans_type = 0
+                else:
+                    ans_type = answer_to_id[final_answers[i]]
+                    if ans_type == 0:
+                        ans_type = 1
+                all_answer_types.append(ans_type)
+                
+                # --- Oracle answer_types (based on ground truth) ---
+                if true_rewards[i] > 0:
+                    oracle_type = 0
+                else:
+                    oracle_type = answer_to_id[final_answers[i]]
+                    if oracle_type == 0:
+                        oracle_type = 1
+                all_oracle_answer_types.append(oracle_type)
+                
                 all_consistency_rates.append(consistency_rate)
-                # Store accuracy rate (same for all samples in this prompt group)
                 all_accuracy_rates.append(accuracy_rate)
-                # Store label accuracy (same for all samples in this prompt group)
                 all_label_accuracies.append(label_accuracy)
 
             for k, v in ttrl_metrics.items():
@@ -445,25 +471,26 @@ class DiversityTTRLRewardManager:
 
         data.batch["acc"] = torch.tensor(scores, dtype=torch.float32, device=data.batch["prompts"].device)
         
-        # === NEW: Store answer_types, consistency_rate, and accuracy_rate in non_tensor_batch for advantage computation ===
-        # Only store for the samples that will be used in training (first n_samples_per_prompt per prompt)
+        # Store per-sample arrays for downstream advantage computation (only training samples)
         training_answer_types = []
+        training_oracle_answer_types = []
         training_consistency_rates = []
         training_accuracy_rates = []
-        training_label_accuracies = []  # NEW
+        training_label_accuracies = []
         for prompt_i in range(prompt_num):
             for i in range(self.n_samples_per_prompt):
                 global_idx = prompt_i * self.n_votes_per_prompt + i
                 training_answer_types.append(all_answer_types[global_idx])
+                training_oracle_answer_types.append(all_oracle_answer_types[global_idx])
                 training_consistency_rates.append(all_consistency_rates[global_idx])
                 training_accuracy_rates.append(all_accuracy_rates[global_idx])
-                training_label_accuracies.append(all_label_accuracies[global_idx])  # NEW
+                training_label_accuracies.append(all_label_accuracies[global_idx])
         
-        # Store in ttrl_info for downstream use
         ttrl_info["_answer_types"] = np.array(training_answer_types)
+        ttrl_info["_oracle_answer_types"] = np.array(training_oracle_answer_types)
         ttrl_info["_consistency_rate"] = np.array(training_consistency_rates)
         ttrl_info["_accuracy_rate"] = np.array(training_accuracy_rates)
-        ttrl_info["_label_accuracy"] = np.array(training_label_accuracies)  # NEW: Binary indicator
+        ttrl_info["_label_accuracy"] = np.array(training_label_accuracies)
 
         print("\n=== TTRL Training Metrics Summary ===")
         for k, v in all_ttrl_metrics.items():

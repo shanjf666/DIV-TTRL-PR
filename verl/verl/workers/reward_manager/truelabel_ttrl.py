@@ -232,10 +232,6 @@ class TrueLabelTTRLRewardManager:
             
             # Compute metrics directly (no need for test_time_train_metrics which uses majority voting)
             ground_truth_ratio = sum(true_rewards) / len(true_rewards)
-            ttrl_metrics = {
-                "ground_truth_ratio": ground_truth_ratio,
-                f"pass@{len(group_pred_outputs)}": 1.0 if sum(true_rewards) >= 1 else 0.0,
-            }
 
             # Compute answer types for PASS_GRPO
             # answer_type = 0 means correct (matches ground truth), else unique hash
@@ -246,7 +242,38 @@ class TrueLabelTTRLRewardManager:
                 else:
                     all_answer_types.append(hash(final_answers[i]))  # Unique type for incorrect
 
-            # Metrics already computed above
+            # Compute majority vote accuracy (label_accuracy)
+            counter = Counter(final_answers)
+            majority_answer, majority_count = counter.most_common(1)[0]
+            majority_ratio = majority_count / len(final_answers)
+            label_accuracy = 1.0 if auto_verify(
+                task, [majority_answer], [ground_truth], extra_info=[group_extra_info[0]]
+            )[0][0] else 0.0
+
+            # Compute majority_rewards: which samples match majority vote (pseudo-label perspective)
+            majority_rewards, _ = auto_verify(
+                task, group_pred_outputs, [majority_answer] * len(group_pred_outputs),
+                extra_info=group_extra_info
+            )
+
+            # false_positive_rate: fraction of majority-matching samples that are actually wrong
+            n_pseudo_pos = sum(1 for m in majority_rewards if m > 0)
+            n_false_pos = sum(1 for m, t in zip(majority_rewards, true_rewards) if m > 0 and t == 0)
+            fp_rate = n_false_pos / n_pseudo_pos if n_pseudo_pos > 0 else 0.0
+
+            # false_negative_rate: fraction of majority-non-matching samples that are actually correct
+            n_pseudo_neg = sum(1 for m in majority_rewards if m == 0)
+            n_false_neg = sum(1 for m, t in zip(majority_rewards, true_rewards) if m == 0 and t > 0)
+            fn_rate = n_false_neg / n_pseudo_neg if n_pseudo_neg > 0 else 0.0
+
+            ttrl_metrics = {
+                "ground_truth_ratio": ground_truth_ratio,
+                f"pass@{len(group_pred_outputs)}": 1.0 if sum(true_rewards) >= 1 else 0.0,
+                "label_accuracy": label_accuracy,
+                "majority_ratio": majority_ratio,
+                "false_positive_rate": fp_rate,
+                "false_negative_rate": fn_rate,
+            }
 
             for k, v in ttrl_metrics.items():
                 all_ttrl_metrics[k].append(v)
