@@ -1,7 +1,6 @@
 #!/bin/bash
 """
-CUDA_VISIBLE_DEVICES=2,3,4,5 bash examples/labelfree/math_server.sh --backbone /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
-CUDA_VISIBLE_DEVICES=2,3,4,5 bash examples/labelfree/math_server.sh --task AIME --backbone /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
+CUDA_VISIBLE_DEVICES=2,3,4,5 bash examples/labelfree/aime24_server.sh --task AIME --backbone /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
 python /data/home/jianfeng/DIV-TTRL-PR/verl/scripts/model_merger.py \
     --backend fsdp \
     --local_dir /data/home/jianfeng/model/TTRL-AIME24/AIME-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/230602/global_step_45/actor \
