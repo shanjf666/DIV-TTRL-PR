@@ -416,7 +416,7 @@ class TTRLRewardManager:
 
             # Call verification function separately by task and backfill results to corresponding sample positions
             for task_key, group in task_groups.items():
-                rewards, verify_extra_info = auto_verify(task_key, group["outputs"], group["labels"], extra_info=group["extra"], num_workers=max(8, (os.cpu_count() or 2) - 1))
+                rewards, verify_extra_info = auto_verify(task_key, group["outputs"], group["labels"], extra_info=group["extra"], num_workers=max(1, (os.cpu_count() or 2) - 1))
                 # Aggregate extra information
                 for k, v in verify_extra_info.items():
                     if isinstance(v, list):
