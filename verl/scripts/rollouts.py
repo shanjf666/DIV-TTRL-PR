@@ -105,6 +105,13 @@ def remove_boxed(s):
 def strip_string(string):
     if string is None:
         return ""
+    string = str(string)
+    # Handle ground truth boxed format if present
+    if "\\boxed{" in string:
+        # rollouts.py has extract_model_answer instead of extract_answer
+        extracted = extract_model_answer(string)
+        if extracted is not None:
+            string = extracted
     string = string.replace("\n", "")
     string = string.replace("\\!", "")
     string = string.replace("\\\\", "\\")
@@ -308,8 +315,8 @@ def main(args):
                 
                 extracted_answers.append(norm_ans)
             
-            # 3. 统计频率 (排除 [NO_ANSWER])
-            valid_answers = [a for a in extracted_answers if a != "[NO_ANSWER]"]
+            # 3. 统计频率 (排除 [NO_ANSWER] 和空答案)
+            valid_answers = [a for a in extracted_answers if a not in ["[NO_ANSWER]", ""]]
             counter = Counter(valid_answers)
             # 获取出现次数最多的 (answer, count)
             most_common = counter.most_common(1)

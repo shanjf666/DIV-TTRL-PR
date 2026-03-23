@@ -185,6 +185,9 @@ reward_model:
   reward_kwargs:
     n_samples_per_prompt: 8
     n_votes_per_prompt: 8
+    k: 4
+    alpha: 0.6
+    beta: 0.4
     mode: "train"
 
 custom_reward_function:

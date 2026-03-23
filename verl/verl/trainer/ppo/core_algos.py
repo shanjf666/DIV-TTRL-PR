@@ -20,86 +20,12 @@ implement PPO
 
 from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
-import math
 
 import numpy as np
 import torch
 from scipy.special import gammaln
 
 import verl.utils.torch_functional as verl_F
-
-
-# ==============================================================================
-# Delta Pass@k: Label-Free Expected Marginal Contribution Utilities
-# ==============================================================================
-
-def compute_delta_pass_k(N: int, c: int, k: int) -> float:
-    """
-    Compute the marginal contribution Δ(c) of one sample to a cluster of size c
-    in the Pass@k probability.
-    
-    Δ(c) = S(c) - S(c-1) = C(N-c, k-1) / C(N, k)
-    
-    This measures how much a single sample's existence raises the probability
-    of its answer cluster being sampled in a random k-subset.
-    
-    Properties:
-        - Strictly monotonically decreasing in c
-        - Maximum at c=1: Δ(1) = k/N
-        - Approaches 0 as c → N-k+1
-    
-    Args:
-        N: Total number of samples (rollout universe size)
-        c: Current cluster size (how many times this answer appeared)
-        k: Target k for pass@k
-    
-    Returns:
-        float: The marginal contribution value
-    """
-    if c > N or c < 1:
-        return 0.0
-    if (N - c) < (k - 1):
-        # When cluster is so big that remaining samples can't fill k-1 slots,
-        # the marginal contribution is 0 (already saturated)
-        return 0.0
-    if k <= 0 or N <= 0:
-        return 0.0
-    return math.comb(N - c, k - 1) / math.comb(N, k)
-
-
-def compute_expected_marginal_passk_rewards(
-    cluster_sizes: List[int],
-    N: int,
-    k: int,
-) -> List[float]:
-    """
-    Compute the expected marginal Pass@k reward for each sample based on its
-    cluster size. This is the core "bandpass filter" reward function:
-    
-        g(c) = P(correct) * Δ(c) = (c/N) * Δ(c)
-    
-    where P(correct) ≈ c/N is the Bayesian prior that this cluster is the
-    correct answer (self-consistency frequency).
-    
-    The resulting function has an inverted-U shape:
-        - c=1 (hallucination): P(correct)≈0 → g≈0 (filters noise)
-        - c≈N (majority):      Δ(c)≈0     → g≈0 (penalizes over-exploitation)
-        - c moderate:           g peaks     → rewards exploration
-    
-    Args:
-        cluster_sizes: List of cluster sizes c_i, one per sample (length N)
-        N: Total number of samples
-        k: Target k for pass@k
-    
-    Returns:
-        List[float]: Reward values for each sample
-    """
-    rewards = []
-    for c in cluster_sizes:
-        delta = compute_delta_pass_k(N, c, k)
-        p_correct = c / N if N > 0 else 0.0
-        rewards.append(p_correct * delta)
-    return rewards
 
 
 # ==============================================================================
@@ -214,14 +140,26 @@ def compute_pass_grpo_penalized_advantage(
     k: int,
     epsilon: float = 1e-6
 ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+    """
+    Compute pass_grpo advantage with length diversity reward.
+    
+    All intermediate computation is done on CPU/numpy to avoid CUDA memory
+    fragmentation from many small GPU tensor allocations in loops.
+    Only the final advantage tensor is created on GPU.
+    
+    Components:
+    - A_pass@k: pass@k-based advantage (combinatorial)
+    - R_div: dynamic length diversity reward for correct answers when sc > threshold
+    """
     bs, response_length = token_level_rewards.shape
     device = token_level_rewards.device
     dtype = token_level_rewards.dtype
     
-    lam_div = diversity_density_config.get("lam_div", 0.05)
+    lam_div = diversity_density_config.get("lam_div", 0.2)
     c_max = diversity_density_config.get("c_max", 2.0)
     div_sc_threshold = diversity_density_config.get("div_sc_threshold", 0.3)
-    
+    length_max = diversity_density_config.get("length_max", 4096)
+    mode = diversity_density_config.get("mode", "dynamic")
     with torch.no_grad():
         prompt_to_samples = defaultdict(list)
         prompt_to_answers = defaultdict(list)
@@ -233,9 +171,13 @@ def compute_pass_grpo_penalized_advantage(
             prompt_to_answers[prompt_idx].append(answer_types[i])
             prompt_to_consistency[prompt_idx] = consistency_rates[i]
         
-        actual_lengths_cpu = response_mask.sum(dim=-1).long().cpu().numpy()
+        # Move actual_lengths to CPU once, avoid per-item .item() GPU sync in loop
+        actual_lengths_cpu = response_mask.sum(dim=-1).long().cpu().numpy()  # (bs,)
+        
+        # All intermediate computation on CPU/numpy
         advantages_raw_np = np.zeros(bs, dtype=np.float64)
         
+        # === Logging accumulators ===
         total_r_div = 0.0
         r_div_count = 0
         total_adv_raw = 0.0
@@ -249,8 +191,26 @@ def compute_pass_grpo_penalized_advantage(
             c_maj = sum(1 for a in answers if a == 0)
             c_neg = N - c_maj
             
-            a_pos, a_neg = _compute_passk_probs(N, c_neg, k, epsilon)
+            log_prob_fail = _log_comb(np.array([c_neg]), np.array([k]))[0] - _log_comb(np.array([N]), np.array([k]))[0]
+            prob_fail = np.exp(log_prob_fail) if np.isfinite(log_prob_fail) else 0.0
+            prob_fail = np.clip(prob_fail, 0.0, 1.0)
+            r_mean = 1.0 - prob_fail
+            variance = r_mean * (1.0 - r_mean)
+            std = np.sqrt(variance)
             
+            if std < epsilon:
+                a_pos, a_neg = 0.0, 0.0
+            else:
+                a_pos = prob_fail / std
+                if c_neg >= 1:
+                    log_p_cond_fail = _log_comb(np.array([c_neg - 1]), np.array([k - 1]))[0] - _log_comb(np.array([N - 1]), np.array([k - 1]))[0]
+                    p_cond_fail = np.exp(log_p_cond_fail) if np.isfinite(log_p_cond_fail) else 0.0
+                    p_cond_fail = np.clip(p_cond_fail, 0.0, 1.0)
+                else:
+                    p_cond_fail = 0.0
+                a_neg = (prob_fail - p_cond_fail) / std
+            
+            # All group-level computation on CPU with numpy
             group_raw_adv = np.zeros(N, dtype=np.float64)
             group_r_div = np.zeros(N, dtype=np.float64)
             
@@ -264,30 +224,35 @@ def compute_pass_grpo_penalized_advantage(
                 var_l = sum((x - mu_l)**2 for x in correct_lengths) / len(correct_lengths)
                 sigma_l = np.sqrt(var_l)
                 
-                max_l_group = max(int(actual_lengths_cpu[idx]) for idx in sample_indices)
-                
+                if mode == "dynamic":
+                    current_lam_div = (a_pos) / (c_max + 1e-10) if a_pos > 0 else 0.05
+                elif mode == "static":
+                    current_lam_div = lam_div
                 for local_i, global_i in enumerate(sample_indices):
-                    reward_div = 0.0
                     if answers[local_i] == 0:
                         l_i = int(actual_lengths_cpu[global_i])
-                        div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
-                        reward_div = lam_div * min(div_val, c_max)
-                        
-                        if l_i <= 0.8 * max_l_group:
+                        if l_i < 0.85 * length_max:
+                            div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
+                            reward_div = current_lam_div * min(div_val, c_max)
                             group_r_div[local_i] = reward_div
-                            
-                    if reward_div > 0:
-                        total_r_div += reward_div
-                        r_div_count += 1
+                        
+                            if reward_div > 0:
+                                total_r_div += reward_div
+                                r_div_count += 1
     
             for local_i, global_i in enumerate(sample_indices):
                 a_pass_k = a_pos if answers[local_i] == 0 else a_neg
+                
+                # raw_adv_i = A_pass@k + R_div
                 raw_v = a_pass_k + group_r_div[local_i]
                 group_raw_adv[local_i] = raw_v
                 
                 total_a_passk += a_pass_k
                 total_adv_raw += raw_v
                 
+               
+            # Conditional Normalization: Only re-normalize if rewards were added
+            # If not added, raw_v is the raw Pass@k advantage which is already theoretically normalized
             if N > 1 and sc_ratio > div_sc_threshold:
                 mu_adv = np.mean(group_raw_adv)
                 std_adv = np.std(group_raw_adv, ddof=0)
@@ -303,21 +268,25 @@ def compute_pass_grpo_penalized_advantage(
             "pass_grpo_penalized/r_div_triggered_ratio": r_div_count / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/avg_raw_a_passk": total_a_passk / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/avg_adv_raw": total_adv_raw / bs if bs > 0 else 0.0,
+            "pass_grpo_penalized/lam_div": lam_div,
+            "pass_grpo_penalized/div_sc_threshold": div_sc_threshold,
         }
     
+        # Create GPU tensors only once at the end
         advantages_raw_tensor = torch.tensor(advantages_raw_np, dtype=dtype, device=device)
         advantages = advantages_raw_tensor.unsqueeze(-1) * response_mask
-        returns = advantages.clone()
-        
+        returns = advantages.clone()  # outcome-based: returns == advantages, ensure independent tensors
+
+        # [FIX #2] Explicit GPU memory cleanup to prevent fragmentation
+        # When response_length is large (4096+), intermediate tensors can consume significant memory
         del actual_lengths_cpu
         del advantages_raw_np
-        del advantages_raw_tensor
+        del advantages_raw_tensor  # Explicitly delete intermediate GPU tensor
         
         if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
+            torch.cuda.empty_cache()  # Force cache cleanup to free reserved but unallocated memory
+        
     return advantages, returns, metrics
-
 
 def compute_grpo_outcome_advantage(
     token_level_rewards: torch.Tensor, response_mask: torch.Tensor, index: np.ndarray, epsilon: float = 1e-6
