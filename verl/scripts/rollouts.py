@@ -2,6 +2,7 @@
 python scripts/rollouts.py --model_path /root/autodl-tmp/model/Qwen3-4B-Base --output_file qwen4b.jsonl --num_return_sequences 64 --temperature 1 --dataset_name  --split
 """
 import json
+import os
 import torch
 import re
 import argparse
@@ -244,7 +245,10 @@ def main(args):
     # 加载数据集
     # ----------------------------
     print(f"Loading dataset: {args.dataset_name} ({args.split})")
-    dataset = load_dataset(args.dataset_name, split=args.split)
+    if os.path.exists(args.dataset_name):
+        dataset = load_dataset('json', data_files=args.dataset_name, split='train')
+    else:
+        dataset = load_dataset(args.dataset_name, split=args.split)
 
     if args.max_samples is not None:
         dataset = dataset.select(range(min(args.max_samples, len(dataset))))
@@ -254,7 +258,10 @@ def main(args):
     # ----------------------------
     # 构造 prompts
     # ----------------------------
-    prompts = [build_prompt(item["problem"]) for item in dataset]
+    def get_problem(item):
+        return item.get("prompt", item.get("problem", ""))
+
+    prompts = [build_prompt(get_problem(item)) for item in dataset]
 
     # ----------------------------
     # 生成参数
@@ -339,7 +346,7 @@ def main(args):
             ]
 
             record = {
-                "problem": original_item["problem"],
+                "problem": get_problem(original_item),
                 "answer": original_item.get("answer", original_item.get("solution", None)),
                 "responses": responses,
                 "extracted_answers": extracted_answers, # 可选：保存所有提取出的答案用于调试
