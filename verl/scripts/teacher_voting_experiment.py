@@ -1,18 +1,43 @@
 """
-Teacher-Prompt Generation and Voting Experiment
+Teacher-Prompt Generation and Voting Experiment (Parallel 32-Sample Version)
 
-For each problem with SC < 0.3, takes all 64 original rollouts.
-Constructs a Teacher Verification prompt depending on whether the rollout 
-is "Mainstream" (equals MAJ answer) or "Non-Mainstream".
-Uses vLLM to generate a corrected response for each rollout.
-Extracts the \boxed{} answers from the 64 new responses and performs 
-Majority Voting (MAJ) to see if accuracy improves over the original SC MAJ.
+For each problem with SC < 0.3, discards the original rollouts and extracts 
+the Top-K most frequent (but likely incorrect) answers.
+Constructs a single new prompt for the problem using either:
+  1. 'trap': Warns the model to avoid the Top 3 common mistakes.
+  2. 'mcq': Presents the Top 5 answers as A-E options for reference.
+Uses vLLM to sample N=32 completely new paths in parallel.
+Extracts the \boxed{} answers and performs Majority Voting.
 
-Usage:
-python scripts/teacher_voting_experiment.py \
-    --model_path Qwen/Qwen2.5-7B \
+Usage Example:
+CUDA_VISIBLE_DEVICES=0 python scripts/teacher_voting_experiment.py \
+    --model_path /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
     --input_file scripts/base.jsonl \
-    --output_file scripts/teacher_voting_results.jsonl
+    --strategy trap \
+    --temperature 0.6 \
+    --n_samples 32
+    --output_file out_trap_06.jsonl
+CUDA_VISIBLE_DEVICES=0 python scripts/teacher_voting_experiment.py \
+    --model_path /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
+    --input_file scripts/base.jsonl \
+    --strategy trap \
+    --temperature 1 \
+    --n_samples 32
+    --output_file out_trap_10.jsonl
+CUDA_VISIBLE_DEVICES=0 python scripts/teacher_voting_experiment.py \
+    --model_path /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
+    --input_file scripts/base.jsonl \
+    --strategy mcq \
+    --temperature 0.6 \
+    --n_samples 32
+    --output_file out_mcq_06.jsonl
+CUDA_VISIBLE_DEVICES=0 python scripts/teacher_voting_experiment.py \
+    --model_path /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
+    --input_file scripts/base.jsonl \
+    --strategy mcq \
+    --temperature 1 \
+    --n_samples 32
+    --output_file out_mcq_10.jsonl
 """
 
 import json
@@ -79,43 +104,65 @@ def extract_answer(text):
         return None
     return remove_boxed(boxed)
 
+def get_top_k_answers(extracted_list, k=3):
+    """Get the top K most common valid answers from the list."""
+    valid_ans = [strip_string(a) for a in extracted_list if a and a != "[NO_ANSWER]"]
+    if not valid_ans:
+        return []
+    counter = Counter(valid_ans)
+    most_common = counter.most_common(k)
+    return [ans for ans, count in most_common]
+
 
 # =====================================================
-# 2. Teacher Prompts
+# 2. Base Model Specific Prompts
 # =====================================================
 
-TEACHER_PROMPT_TEMPLATE = """Below is a math problem and a candidate solution.
-
-**[Problem]**
+TRAP_PROMPT_TEMPLATE = """Problem:
 {problem}
 
-**[Candidate Solution ({solution_type})]**
-{rollout}
+[Note]
+This is a highly challenging problem. In previous attempts, many students fell into logical traps or calculation errors and incorrectly answered: {trap_answers}.
 
----
+Please think carefully, avoid these common mistakes, and write down a rigorous step-by-step solution.
+Conclude your final derived result strictly inside a \\boxed{{}} environment.
 
-**[Your Task]**
-{instruction}
+Solution:
+"""
 
-Please provide your verification process and then give your final answer inside \\boxed{{}}.
-Let's think step by step."""
+MCQ_PROMPT_TEMPLATE = """Problem:
+{problem}
 
-MAINSTREAM_INSTRUCTION = """This solution represents the mainstream (majority) approach, but it might be stuck in a local optimum or contain errors. Verify it carefully step-by-step, fix any logical or computational errors you find, and provide the correct final answer."""
+Here are 5 possible answers derived from different methods. The correct answer might be one of them, or it might be none of them:
+{mcq_options}
 
-NON_MAINSTREAM_INSTRUCTION = """This solution represents an unconventional perspective or alternative method. Verify its logic carefully, assess its validity, and attempt to continue deriving along this direction to find the correct final answer."""
+Solve the problem step-by-step through independent derivation. Do not guess. If your final calculated result matches one of the options above, output that result. If your result is different from all options, output your own result.
+Strictly put your final answer inside \\boxed{{}}.
+
+Step-by-step derivation:
+"""
 
 
-def build_verification_prompt(problem, rollout_text, is_mainstream, tokenizer, model_path):
-    """Build the ChatML prompt for Teacher Verification."""
-    sol_type = "Mainstream Approach" if is_mainstream else "Non-Mainstream Approach"
-    instruction = MAINSTREAM_INSTRUCTION if is_mainstream else NON_MAINSTREAM_INSTRUCTION
-
-    content = TEACHER_PROMPT_TEMPLATE.format(
-        problem=problem,
-        solution_type=sol_type,
-        rollout=rollout_text.strip(),
-        instruction=instruction
-    )
+def build_new_prompt(problem, extracted_list, strategy, tokenizer, model_path):
+    """Build the prompt based on the chosen strategy (trap or mcq)."""
+    if strategy == "trap":
+        top_3 = get_top_k_answers(extracted_list, k=3)
+        if not top_3:
+            trap_str = "some incorrect values"
+        else:
+            trap_str = ", ".join(top_3)
+        content = TRAP_PROMPT_TEMPLATE.format(problem=problem, trap_answers=trap_str)
+        
+    elif strategy == "mcq":
+        top_5 = get_top_k_answers(extracted_list, k=5)
+        labels = ["A)", "B)", "C)", "D)", "E)"]
+        options_str = ""
+        for i in range(5):
+            ans = top_5[i] if i < len(top_5) else "None of the above"
+            options_str += f"{labels[i]} {ans}\n"
+        content = MCQ_PROMPT_TEMPLATE.format(problem=problem, mcq_options=options_str.strip())
+    else:
+        raise ValueError(f"Unknown strategy: {strategy}")
 
     name = model_path.lower()
     if "instruct" in name or "llama" in name:
@@ -127,6 +174,7 @@ def build_verification_prompt(problem, rollout_text, is_mainstream, tokenizer, m
             )
         except Exception:
             pass
+            
     return content
 
 
@@ -134,7 +182,7 @@ def build_verification_prompt(problem, rollout_text, is_mainstream, tokenizer, m
 # 3. Analysis & Reporting
 # =====================================================
 
-def print_full_comparison(results):
+def print_full_comparison(results, strategy, temp):
     buckets = [
         ("Low (SC<0.3)",  lambda r: r["sc_score"] < 0.3),
         ("Mid (0.3-0.7)", lambda r: 0.3 <= r["sc_score"] < 0.7),
@@ -142,9 +190,9 @@ def print_full_comparison(results):
         ("ALL",           lambda r: True),
     ]
 
-    print("\n" + "=" * 100)
-    print("TEACHER-PROMPT GENERATION & VOTING RESULTS")
-    print("=" * 100)
+    print("\n" + "=" * 105)
+    print(f"TEACHER-PROMPT RESULTS | Strategy: {strategy.upper()} | Temp: {temp}")
+    print("=" * 105)
 
     header = (
         f"  {'Bucket':<16} {'N':>5}  "
@@ -152,7 +200,7 @@ def print_full_comparison(results):
         f"{'Rescued':>7}  {'Harmed':>6}"
     )
     print(header)
-    print("  " + "-" * 96)
+    print("  " + "-" * 101)
 
     for bname, bfn in buckets:
         bucket = [r for r in results if bfn(r)]
@@ -180,7 +228,6 @@ def print_full_comparison(results):
     if not low:
         return
 
-    n_low = len(low)
     print(f"\n  Transition Matrix (Orig MAJ → Teacher MAJ) [Low SC]:")
     both_correct = sum(1 for r in low if r["maj_correct"] and r["teacher_maj_correct"])
     rescued = sum(1 for r in low if not r["maj_correct"] and r["teacher_maj_correct"])
@@ -192,27 +239,6 @@ def print_full_comparison(results):
     print(f"    Orig MAJ ✓ → Teacher MAJ ✗ (harmed):    {harmed}")
     print(f"    Orig MAJ ✗ → Teacher MAJ ✗ (still ✗):   {both_wrong}")
     print(f"    Net gain: {rescued - harmed:+d}")
-
-    print(f"\n  {'─'*110}")
-    print(f"  Sample Detail (first 20 low-SC problems):")
-    print(f"  {'Idx':<5} {'Base SC':>8} {'Orig MAJ':>10} {'Teach MAJ':>10} {'Teach SC':>10} {'Transition':<15}")
-    print(f"  {'─'*110}")
-    for r in low[:20]:
-        sc = f"{r['sc_score']:.2f}"
-        maj_c = "✓" if r["maj_correct"] else "✗"
-        teach_c = "✓" if r["teacher_maj_correct"] else "✗"
-        teach_sc = f"{r.get('teacher_sc_score', 0.0):.2f}"
-        
-        if not r["maj_correct"] and r["teacher_maj_correct"]:
-            trans = "RESCUED"
-        elif r["maj_correct"] and not r["teacher_maj_correct"]:
-            trans = "HARMED"
-        elif r["maj_correct"] and r["teacher_maj_correct"]:
-            trans = "kept ✓"
-        else:
-            trans = "still ✗"
-            
-        print(f"  {r['idx']:<5} {sc:>8} {maj_c:>10} {teach_c:>10} {teach_sc:>10} {trans:<15}")
 
 
 # =====================================================
@@ -247,17 +273,17 @@ def main(args):
         dtype="auto",
     )
     
-    # We use greedy decoding for the teacher verification 
-    # since we already have 64 unique contexts
+    # We use temperature > 0 and n_samples for parallel exploration
     sampling_params = SamplingParams(
-        n=1,
-        temperature=0.0,
+        n=args.n_samples,
+        temperature=args.temperature,
+        top_p=0.95 if args.temperature > 0 else 1.0,
         max_tokens=args.max_tokens,
         stop=["<|eot_id|>", "</s>", "<|im_end|>", "Q:"],
     )
 
     all_prompts = []
-    metadata_map = [] # To map prompt index back to (problem_idx, rollout_idx)
+    metadata_map = [] # To map prompt index back to problem_idx
     all_results = []
 
     for idx, item in enumerate(data):
@@ -273,7 +299,6 @@ def main(args):
             "sc_score": sc_score,
             "maj_answer": maj_answer,
             "maj_correct": (maj_answer == gt_norm),
-            # Default fallbacks
             "was_reprompted": False,
             "teacher_maj_answer": maj_answer,
             "teacher_maj_correct": (maj_answer == gt_norm),
@@ -283,49 +308,32 @@ def main(args):
         all_results.append(result)
 
         if sc_score < 0.3:
-            responses = item.get("responses", [])
             extracted = item.get("extracted_answers", [])
+            prompt = build_new_prompt(item["problem"], extracted, args.strategy, tokenizer, args.model_path)
             
-            for r_idx, (resp, ans) in enumerate(zip(responses, extracted)):
-                if not resp or ans == "[NO_ANSWER]":
-                    continue
-                
-                norm_ans = strip_string(ans)
-                is_mainstream = (norm_ans == maj_answer)
-                
-                prompt = build_verification_prompt(
-                    item["problem"], resp, is_mainstream, tokenizer, args.model_path
-                )
-                
-                all_prompts.append(prompt)
-                metadata_map.append({
-                    "problem_idx": idx,
-                    "rollout_idx": r_idx
-                })
+            all_prompts.append(prompt)
+            metadata_map.append(idx)
 
-    print(f"Total Teacher generation prompts built: {len(all_prompts)}")
-
+    print(f"Total Unique Teacher Prompts (1 per low-SC problem): {len(all_prompts)}")
+    print(f"Parallel samples per prompt: {args.n_samples} | Temperature: {args.temperature}")
+    
     print("Generating Teacher Verification responses...")
     outputs = llm.generate(all_prompts, sampling_params)
 
-    # Dictionary to collect new answers per problem mapping p_idx -> list of norm_answers
-    teacher_answers_per_prob = {idx: [] for idx, item in enumerate(data) if item.get("sc_score", 1.0) < 0.3}
-
+    # Process exactly 32 outputs per problem
     for i, output in enumerate(outputs):
-        p_idx = metadata_map[i]["problem_idx"]
-        response_text = output.outputs[0].text
+        p_idx = metadata_map[i]
         
-        raw_ans = extract_answer(response_text)
-        norm_ans = strip_string(raw_ans) if raw_ans else "[NO_ANSWER]"
-        
-        teacher_answers_per_prob[p_idx].append(norm_ans)
-
-    # Calculate new Majority Vote
-    for p_idx, answers in teacher_answers_per_prob.items():
+        answers_for_this_prob = []
+        for gen_out in output.outputs:
+            raw_ans = extract_answer(gen_out.text)
+            norm_ans = strip_string(raw_ans) if raw_ans else "[NO_ANSWER]"
+            answers_for_this_prob.append(norm_ans)
+            
         all_results[p_idx]["was_reprompted"] = True
-        all_results[p_idx]["teacher_derived_answers"] = answers
+        all_results[p_idx]["teacher_derived_answers"] = answers_for_this_prob
         
-        valid_answers = [a for a in answers if a != "[NO_ANSWER]"]
+        valid_answers = [a for a in answers_for_this_prob if a != "[NO_ANSWER]"]
         counter = Counter(valid_answers)
         most_common = counter.most_common(1)
         
@@ -340,14 +348,13 @@ def main(args):
         all_results[p_idx]["teacher_maj_correct"] = (best_ans == all_results[p_idx]["gt_norm"])
         all_results[p_idx]["teacher_sc_score"] = teacher_sc_score
 
-    print_full_comparison(all_results)
+    print_full_comparison(all_results, args.strategy, args.temperature)
     
     if args.output_file:
         print(f"\nSaving detailed results to {args.output_file}")
         with open(args.output_file, "w", encoding="utf-8") as f:
             for r in all_results:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
     print("\nDone!")
 
 
@@ -356,9 +363,16 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True, help="HuggingFace model path")
     parser.add_argument("--input_file", type=str, default="scripts/base.jsonl", help="Input JSONL")
     parser.add_argument("--output_file", type=str, default="scripts/teacher_voting_results.jsonl", help="Output JSONL")
+    
+    # NEW ARGUMENTS
+    parser.add_argument("--strategy", type=str, choices=["trap", "mcq"], default="trap", 
+                        help="'trap' explicitly warns against top 3 errors. 'mcq' lists top 5 as A-E options.")
+    parser.add_argument("--temperature", type=float, default=0.6, help="Sampling temperature")
+    parser.add_argument("--n_samples", type=int, default=32, help="Number of parallel samples per prompt")
+    
     parser.add_argument("--tensor_parallel_size", type=int, default=1, help="vLLM tensor parallel size")
     parser.add_argument("--max_model_len", type=int, default=4096, help="Max context length to restrict KV cache size")
-    parser.add_argument("--gpu_memory_utilization", type=float, default=0.7, help="Fraction of GPU memory for vLLM")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.8, help="Fraction of GPU memory for vLLM")
     parser.add_argument("--enforce_eager", action="store_true", help="Disable CUDA graphs (saves some memory)")
     parser.add_argument("--max_tokens", type=int, default=4096, help="Max tokens for Teacher generation")
     args = parser.parse_args()

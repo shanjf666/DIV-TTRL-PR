@@ -20,7 +20,7 @@ _TASK2VERIFY = {
 _DEFAULT_NUM_WORKERS = min(8, os.cpu_count() or 1)
 
 # Minimum batch size to trigger multiprocessing (below this, serial is faster)
-_MIN_PARALLEL_BATCH = 16
+_MIN_PARALLEL_BATCH = 48
 
 
 def _verify_single(args):

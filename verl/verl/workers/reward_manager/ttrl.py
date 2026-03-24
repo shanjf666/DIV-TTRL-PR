@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from collections import defaultdict, Counter
 
 import numpy as np
@@ -28,7 +27,7 @@ from verl.utils.reward_score.ttrl.ttt_metrics import (
 class TTRLRewardManager:
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1) -> None:
+    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, teacher_label_path=None) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.reward_fn_key = reward_fn_key
@@ -37,6 +36,28 @@ class TTRLRewardManager:
         self.mode = mode
         self.eval_n_samples = eval_n_samples
         assert n_votes_per_prompt >= n_samples_per_prompt, f"For TTRL settings, n_votes_per_prompt {n_votes_per_prompt} should be greater than or equal to n_samples_per_prompt {n_samples_per_prompt}"
+
+        self.teacher_labels = {}
+        if teacher_label_path:
+            import json
+            print(f"Loading teacher labels from {teacher_label_path}...")
+            try:
+                with open(teacher_label_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.strip():
+                            item = json.loads(line)
+                            # Key by problem string for lookup
+                            problem = item.get("problem") or item.get("instruction")
+                            answer = item.get("ground_truth") or item.get("response") # if it's from our script, response is the best rollout
+                            # However, for reward calculation, we might want the final answer string from 'ground_truth'
+                            # In our select_pseudo_labels.py, we have 'ground_truth' (raw) and 'response' (full reasoning)
+                            # test_time_train_metrics uses auto_verify which can take either. 
+                            # If we use the 'response' from our file, it contains the \boxed{} answer.
+                            if problem and answer:
+                                self.teacher_labels[problem] = answer
+                print(f"Loaded {len(self.teacher_labels)} teacher labels.")
+            except Exception as e:
+                print(f"Error loading teacher labels: {e}")
 
         print(f"TTRLRewardManager initialized with n_votes_per_prompt {n_votes_per_prompt}, n_samples_per_prompt {n_samples_per_prompt}, eval_n_samples {eval_n_samples}")
 
@@ -250,7 +271,32 @@ class TTRLRewardManager:
                     group_pred_outputs.append(response_str)
                     group_extra_info.append(extra_info)
 
-                rewards, ttrl_metrics = test_time_train_metrics(group_pred_outputs, group_labels, task=task, extra_info=group_extra_info)
+                # Calculate SC (consistency rate) first to decide strategy
+                # We need to extract answers to calculate consistency
+                final_answers_pre = auto_extract(task, group_pred_outputs, extra_info=group_extra_info)
+                freq_pre = Counter(final_answers_pre)
+                majority_num_pre = max(freq_pre.values()) if freq_pre else 0
+                sc_score = majority_num_pre / self.n_votes_per_prompt if self.n_votes_per_prompt > 0 else 0.0
+
+                verified_label = None
+                if self.teacher_labels and sc_score < 0.3:
+                    # Try to use teacher label
+                    # Try exact match first
+                    teacher_ans = self.teacher_labels.get(prompt_str)
+                    
+                    # If not found, try to find a key that is contained within prompt_str (more robust for decoded tokens)
+                    if not teacher_ans:
+                        # Optional: limit search if dictionary is very large, but usually it's a few thousand problems
+                        for prob_key, ans_val in self.teacher_labels.items():
+                            if prob_key in prompt_str:
+                                teacher_ans = ans_val
+                                break
+                    
+                    if teacher_ans:
+                        verified_label = teacher_ans
+                        # print(f"    Low consistency (SC={sc_score:.3f}). Using teacher label.")
+
+                rewards, ttrl_metrics = test_time_train_metrics(group_pred_outputs, group_labels, task=task, extra_info=group_extra_info, verified_label=verified_label)
 
                 # === Compute FP/FN rates (pseudo-label vs ground truth) ===
                 ground_truth = group_labels[0]
@@ -416,7 +462,7 @@ class TTRLRewardManager:
 
             # Call verification function separately by task and backfill results to corresponding sample positions
             for task_key, group in task_groups.items():
-                rewards, verify_extra_info = auto_verify(task_key, group["outputs"], group["labels"], extra_info=group["extra"], num_workers=max(1, (os.cpu_count() or 2) - 1))
+                rewards, verify_extra_info = auto_verify(task_key, group["outputs"], group["labels"])
                 # Aggregate extra information
                 for k, v in verify_extra_info.items():
                     if isinstance(v, list):
