@@ -27,7 +27,7 @@ from verl.utils.reward_score.ttrl.ttt_metrics import (
 class TTRLRewardManager:
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None, enable_hybrid=True) -> None:
+    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None, enable_hybrid=False) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.reward_fn_key = reward_fn_key

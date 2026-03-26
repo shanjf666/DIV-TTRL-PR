@@ -225,7 +225,7 @@ def compute_pass_grpo_penalized_advantage(
                 sigma_l = np.sqrt(var_l)
                 
                 if mode == "dynamic":
-                    current_lam_div = (a_pos) / (c_max + 1e-10) if a_pos > 0 else 0.05
+                    current_lam_div = (a_pos) / (c_max + 1e-10) if a_pos > 0 else lam_div
                 elif mode == "static":
                     current_lam_div = lam_div
                 for local_i, global_i in enumerate(sample_indices):
