@@ -283,9 +283,8 @@ class RLHFDataset(Dataset):
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
-        # encode prompts without chat template
-        if self.return_raw_chat:
-            row_dict["raw_prompt"] = messages
+        # Always store raw messages for explore trainer's Round 2 prompt construction
+        row_dict["raw_prompt"] = messages
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
