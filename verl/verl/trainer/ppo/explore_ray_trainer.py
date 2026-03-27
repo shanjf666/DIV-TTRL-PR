@@ -107,6 +107,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         new_input_ids_list = []
 
         for prompt_idx in low_indices:
+            # Get the majority answer to build the verification prompt
+            result = consistency_results[prompt_idx]
+            majority_answer = result.get("majority_answer", "None")
+            verify_text = f"The previous majority answer is {majority_answer}. Please verify if it is correct and provide your own derivation."
+
             # Use raw_prompt (messages list) if available for cleaner templating
             messages = None
             if "raw_prompt" in gen_batch.non_tensor_batch:
