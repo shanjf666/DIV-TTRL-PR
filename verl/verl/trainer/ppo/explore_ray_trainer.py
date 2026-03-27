@@ -110,7 +110,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             # Get the majority answer to build the verification prompt
             result = consistency_results[prompt_idx]
             majority_answer = result.get("majority_answer", "None")
-            verify_text = f"The previous majority answer is {majority_answer}. Please verify if it is correct and provide your own derivation."
+            verify_text = self.explore_prompt_template.format(majority_answer=majority_answer)
 
             # Use raw_prompt (messages list) if available for cleaner templating
             messages = None
@@ -159,8 +159,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
             # Print first modified prompt for debugging
             if prompt_idx == low_indices[0]:
+                original_len = int(gen_batch.batch["attention_mask"][prompt_idx].sum().item())
                 print(f"[Explore] Modified prompt (first sample, idx={prompt_idx}):")
-                print(f"  Original length: {valid_length}, New length: {len(new_ids)}")
+                print(f"  Original length: {original_len}, New length: {len(new_ids)}")
                 # Print the last 200 chars to verify injection
                 print(f"  ...{modified_prompt[-200:]}")
 
@@ -197,12 +198,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             "position_ids": torch.stack(position_ids_list).to(device),
         }
 
-        # Carry over raw_prompt_ids for the selected indices
+        # Update raw_prompt_ids to match the new modified prompts
         non_tensors = {}
-        if "raw_prompt_ids" in gen_batch.non_tensor_batch:
-            non_tensors["raw_prompt_ids"] = gen_batch.non_tensor_batch["raw_prompt_ids"][
-                np.array(low_indices)
-            ]
+        non_tensors["raw_prompt_ids"] = np.array(
+            [ids.tolist() for ids in new_input_ids_list], dtype=object
+        )
         if "raw_prompt" in gen_batch.non_tensor_batch:
             non_tensors["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"][
                 np.array(low_indices)
