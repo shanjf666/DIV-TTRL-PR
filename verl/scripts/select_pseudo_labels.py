@@ -59,12 +59,14 @@ def main():
             extracted_answers = item.get("extracted_answers", [])
             metrics = item.get("response_metrics", [])
             
-            # 1. Identify final voted answer (Check if teacher-refined version exists)
-            was_reprompted = item.get("was_reprompted", False)
-            if was_reprompted:
-                voted_answer = strip_string(item.get("teacher_maj_answer"))
-                sc_score = item.get("teacher_sc_score", 0.0)
+            # 1. Identify final voted answer (Prioritize teacher-refined version)
+            teacher_maj_answer = item.get("teacher_maj_answer")
+            if teacher_maj_answer is not None:
+                voted_answer = strip_string(teacher_maj_answer)
+                sc_score = item.get("teacher_sc_score", item.get("sc_score", 0.0))
+                was_reprompted = item.get("was_reprompted", False)
             else:
+                was_reprompted = False
                 # Standard majority voting from original rollouts
                 valid_extracted = []
                 for i, ans in enumerate(extracted_answers):

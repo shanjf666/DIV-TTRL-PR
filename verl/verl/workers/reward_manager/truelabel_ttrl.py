@@ -53,6 +53,7 @@ class TrueLabelTTRLRewardManager:
         mode: str = "eval",
         eval_n_samples: int = 1,
         noise_rate: float = 0.0,
+        **kwargs,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine

@@ -1231,6 +1231,7 @@ class RayPPOTrainer:
                                 "n_gram_size": getattr(self.config.algorithm, "n_gram_size", 3),
                                 "use_rep_penalty": getattr(self.config.algorithm, "use_rep_penalty", False),
                                 "div_sc_threshold": getattr(self.config.algorithm, "div_sc_threshold", 0.5),
+                                "mode": getattr(self.config.algorithm, "diversity_density_mode", "dynamic"),
                             }
                         
                         batch = compute_advantage(

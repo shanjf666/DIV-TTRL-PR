@@ -27,7 +27,7 @@ from verl.utils.reward_score.ttrl.ttt_metrics import (
 class TTRLRewardManager:
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None) -> None:
+    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None, enable_hybrid=False, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.reward_fn_key = reward_fn_key
@@ -36,6 +36,7 @@ class TTRLRewardManager:
         self.mode = mode
         self.eval_n_samples = eval_n_samples
         self.pseudo_label_file = pseudo_label_file
+        self.enable_hybrid = enable_hybrid
         
         self.offline_pseudo_labels = {}
         if pseudo_label_file:
@@ -349,15 +350,11 @@ class TTRLRewardManager:
                 # 3. Hybrid logic: If online consistency is low, fallback to offline label
                 verified_label = None
                 off_policy = 0.0
-                if online_consistency_rate < 0.3:
+                if self.enable_hybrid and online_consistency_rate < 0.3:
                     if offline_voted_answer:
                         verified_label = offline_voted_answer
                         off_policy = 1.0
-                        if prompt_i < 2: # Only print for first few groups to avoid spam
-                            print(f"[Hybrid] Online SC {online_consistency_rate:.2f} < 0.3. Using offline pseudo-label: {verified_label[:50]}...")
                     else:
-                        if prompt_i < 2:
-                            print(f"[Hybrid] Warning: Online SC {online_consistency_rate:.2f} < 0.3 but NO offline label found.")
                         if self.pseudo_label_file:
                             print(f"Warning: Online SC {online_consistency_rate:.2f} < 0.3 but no label found for prompt in {self.pseudo_label_file}")
                 
