@@ -217,6 +217,60 @@ class TTRLRewardManager:
                 post_ttrl_info[k] = v
         return post_ttrl_info
 
+    def compute_majority_and_consistency(self, data: DataProto):
+        """
+        Lightweight pass: extract majority answer and consistency rate per prompt.
+        
+        Args:
+            data: DataProto with n_votes_per_prompt responses per prompt.
+            
+        Returns:
+            list of dicts, one per prompt, each with keys:
+              - 'majority_answer': the most common extracted answer (str or None)
+              - 'consistency_rate': fraction of responses matching majority answer (float)
+        """
+        assert len(data) % self.n_votes_per_prompt == 0, (
+            f"Length of data {len(data)} should be divisible by n_votes_per_prompt {self.n_votes_per_prompt}"
+        )
+        prompt_num = len(data) // self.n_votes_per_prompt
+        results = []
+
+        for prompt_i in range(prompt_num):
+            group_pred_outputs = []
+            group_extra_info = []
+            task = None
+
+            for i in range(self.n_votes_per_prompt):
+                data_item = data[prompt_i * self.n_votes_per_prompt + i]
+                prompt_idx = data_item.batch["prompts"]
+                prompt_length = prompt_idx.shape[-1]
+                valid_prompt_length = data_item.batch["attention_mask"][:prompt_length].sum()
+                response_idx = data_item.batch["responses"]
+                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                valid_response_idx = response_idx[:valid_response_length]
+
+                response_str = self.tokenizer.decode(valid_response_idx, skip_special_tokens=False)
+                data_source = data_item.non_tensor_batch[self.reward_fn_key]
+                extra_info = data_item.non_tensor_batch["extra_info"]
+
+                if task is None:
+                    task = self._data_source_to_task(data_source)
+
+                group_pred_outputs.append(response_str)
+                group_extra_info.append(extra_info)
+
+            model_answers = auto_extract(task, group_pred_outputs, extra_info=group_extra_info)
+            counter = Counter(model_answers)
+            voted_answer, majority_count = counter.most_common(1)[0] if counter else (None, 0)
+            consistency_rate = majority_count / self.n_votes_per_prompt if self.n_votes_per_prompt > 0 else 0.0
+
+            results.append({
+                "majority_answer": voted_answer,
+                "consistency_rate": consistency_rate,
+            })
+
+        return results
+
     def _compute_ttrl_reward(self, data: DataProto):
 
             reward_extra_info = defaultdict(list)

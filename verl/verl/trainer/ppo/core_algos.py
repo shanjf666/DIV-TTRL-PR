@@ -270,6 +270,8 @@ def compute_pass_grpo_penalized_advantage(
             "pass_grpo_penalized/avg_adv_raw": total_adv_raw / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/lam_div": lam_div,
             "pass_grpo_penalized/div_sc_threshold": div_sc_threshold,
+            "pass_grpo_penalized/lam_div": lam_div,
+            "pass_grpo_penalized/div_sc_threshold": div_sc_threshold,
         }
     
         # Create GPU tensors only once at the end
