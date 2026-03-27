@@ -373,6 +373,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                             # --- Round 2 Rollout (if needed) ---
                             if low_indices:
+                                # Clean up temporary batch before generating Round 2 to save memory
+                                del tmp_batch
+                                gc.collect()
+                                torch.cuda.empty_cache()
+
                                 # Build self-verify prompts for low-consistency samples
                                 explore_gen_batch = self._build_explore_gen_batch(
                                     gen_batch, low_indices, consistency_results
@@ -406,9 +411,12 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                                 del explore_gen_batch, explore_gen_batch_padded
                                 del explore_output_padded, explore_output
-
-                            # Clean up temporary batch
-                            del tmp_batch
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                            else:
+                                del tmp_batch
+                                gc.collect()
+                                torch.cuda.empty_cache()
 
                     # ============================================================
                     # REMAX baseline (unchanged from original)
