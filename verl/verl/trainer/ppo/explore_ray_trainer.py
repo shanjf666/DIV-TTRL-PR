@@ -209,7 +209,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         return explore_batch
 
     # ------------------------------------------------------------------ #
-    #  Helper: Merge high-consistency R1 outputs + low-consistency R2 outputs
+    #  Helper: In-place replace low-consistency R1 slices with R2 outputs
     # ------------------------------------------------------------------ #
     def _merge_explore_outputs(
         self,
@@ -220,46 +220,66 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         n_votes_per_prompt,
     ):
         """
-        Reconstruct the full gen_batch_output by:
-          - Keeping round-1 responses for high-consistency prompts
-          - Replacing with round-2 responses for low-consistency prompts
+        In-place replacement: directly overwrite the low-consistency prompt
+        slices in gen_batch_output with the Round-2 explore_output.
 
-        Args:
-            gen_batch_output: Original round-1 output (all prompts * n_votes).
-            explore_output: Round-2 output (low-consistency prompts * n_votes).
-            high_indices: Prompt indices that keep round-1 responses.
-            low_indices: Prompt indices that use round-2 responses.
-            n_votes_per_prompt: Number of responses per prompt.
-
-        Returns:
-            DataProto: Merged output with same structure as gen_batch_output.
+        This avoids DataProto.concat entirely, eliminating padding/length
+        mismatch bugs. If R2 has a different sequence length than R1, the
+        shorter side is padded to match.
         """
-        # Build a mapping: low_idx -> position in explore_output
-        low_idx_to_explore = {idx: i for i, idx in enumerate(low_indices)}
+        if not low_indices or explore_output is None:
+            return gen_batch_output
 
-        # Collect output DataProtos in original prompt order
-        all_protos = []
-        total_prompts = len(high_indices) + len(low_indices)
+        # Get sequence lengths from both sides
+        r1_seq_len = gen_batch_output.batch["input_ids"].shape[1]
+        r2_seq_len = explore_output.batch["input_ids"].shape[1]
+        target_len = max(r1_seq_len, r2_seq_len)
 
-        for prompt_idx in range(total_prompts):
-            start = prompt_idx * n_votes_per_prompt
-            end = start + n_votes_per_prompt
+        # Helper: pad a single tensor along dim=1 to target_len
+        def _pad_to(tensor, target, pad_val=0):
+            if tensor.shape[1] >= target:
+                return tensor
+            pad_shape = (tensor.shape[0], target - tensor.shape[1]) + tensor.shape[2:]
+            padding = torch.full(pad_shape, pad_val, dtype=tensor.dtype, device=tensor.device)
+            return torch.cat([tensor, padding], dim=1)
 
-            if prompt_idx in low_idx_to_explore:
-                # Use round-2 output
-                explore_pos = low_idx_to_explore[prompt_idx]
-                e_start = explore_pos * n_votes_per_prompt
-                e_end = e_start + n_votes_per_prompt
-                all_protos.append(explore_output[e_start:e_end])
-            else:
-                # Use round-1 output
-                all_protos.append(gen_batch_output[start:end])
+        # Step 1: If R1 is shorter, expand gen_batch_output to target_len
+        if r1_seq_len < target_len:
+            new_tensors = {}
+            for key, tensor in gen_batch_output.batch.items():
+                if tensor.dim() >= 2:
+                    pad_val = self.tokenizer.pad_token_id if "input_ids" in key else 0
+                    new_tensors[key] = _pad_to(tensor, target_len, pad_val)
+                else:
+                    new_tensors[key] = tensor
+            gen_batch_output.batch = TensorDict(
+                source=new_tensors, batch_size=gen_batch_output.batch.batch_size
+            )
 
-        # 4. Pad all protos to the same sequence length before concat to avoid RuntimeError
-        all_protos = self._pad_protos_to_common_length(all_protos)
+        # Step 2: For each low-consistency prompt, overwrite its slice
+        for explore_pos, prompt_idx in enumerate(low_indices):
+            r1_start = prompt_idx * n_votes_per_prompt
+            r1_end = r1_start + n_votes_per_prompt
+            e_start = explore_pos * n_votes_per_prompt
+            e_end = e_start + n_votes_per_prompt
 
-        merged = DataProto.concat(all_protos)
-        return merged
+            # Overwrite tensor batch entries
+            for key, tensor in gen_batch_output.batch.items():
+                r2_tensor = explore_output.batch[key][e_start:e_end]
+                if tensor.dim() >= 2 and r2_tensor.shape[1] < target_len:
+                    pad_val = self.tokenizer.pad_token_id if "input_ids" in key else 0
+                    r2_tensor = _pad_to(r2_tensor, target_len, pad_val)
+                gen_batch_output.batch[key][r1_start:r1_end] = r2_tensor
+
+            # Overwrite non-tensor batch entries
+            for key in gen_batch_output.non_tensor_batch:
+                if key in explore_output.non_tensor_batch:
+                    gen_batch_output.non_tensor_batch[key][r1_start:r1_end] = (
+                        explore_output.non_tensor_batch[key][e_start:e_end]
+                    )
+
+        return gen_batch_output
+
 
     # ------------------------------------------------------------------ #
     #  Main training loop (overrides RayPPOTrainer.fit)
