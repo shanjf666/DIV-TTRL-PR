@@ -255,6 +255,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 # Use round-1 output
                 all_protos.append(gen_batch_output[start:end])
 
+        # 4. Pad all protos to the same sequence length before concat to avoid RuntimeError
+        all_protos = self._pad_protos_to_common_length(all_protos)
+
         merged = DataProto.concat(all_protos)
         return merged
 
