@@ -107,38 +107,46 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         new_input_ids_list = []
 
         for prompt_idx in low_indices:
-            # Decode original prompt from input_ids (left-padded)
-            original_ids = gen_batch.batch["input_ids"][prompt_idx]
-            original_mask = gen_batch.batch["attention_mask"][prompt_idx]
-            valid_length = int(original_mask.sum().item())
-            valid_ids = original_ids[-valid_length:]
+            # Use raw_prompt (messages list) if available for cleaner templating
+            messages = None
+            if "raw_prompt" in gen_batch.non_tensor_batch:
+                messages = list(gen_batch.non_tensor_batch["raw_prompt"][prompt_idx])
 
-            original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
-            majority_answer = consistency_results[prompt_idx]["majority_answer"]
-
-            # Build the verify instruction
-            verify_text = self.explore_prompt_template.format(
-                majority_answer=str(majority_answer) if majority_answer is not None else "unknown"
-            )
-
-            # Insert verify text before the assistant turn marker
-            assistant_marker = "<|im_start|>assistant"
-            if assistant_marker in original_prompt:
-                insert_pos = original_prompt.rfind(assistant_marker)
-                # Try to insert before the <|im_end|> that closes the user turn
-                end_marker = "<|im_end|>"
-                end_pos = original_prompt.rfind(end_marker, 0, insert_pos)
-                if end_pos >= 0:
-                    modified_prompt = (
-                        original_prompt[:end_pos] + verify_text + original_prompt[end_pos:]
-                    )
+            if messages is not None:
+                # Add/Embed the verify text into the message list
+                new_messages = deepcopy(messages)
+                if new_messages and new_messages[-1]["role"] == "user":
+                    new_messages[-1]["content"] += "\n\n" + verify_text
                 else:
-                    modified_prompt = (
-                        original_prompt[:insert_pos] + verify_text + "\n" + original_prompt[insert_pos:]
-                    )
+                    new_messages.append({"role": "user", "content": verify_text})
+
+                # Apply chat template with enable_thinking=False
+                modified_prompt = self.tokenizer.apply_chat_template(
+                    new_messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                )
             else:
-                # Fallback: append verify text at the end
-                modified_prompt = original_prompt + verify_text
+                # Original fallback: Manual string injection for Base models without full message history
+                original_ids = gen_batch.batch["input_ids"][prompt_idx]
+                original_mask = gen_batch.batch["attention_mask"][prompt_idx]
+                valid_length = int(original_mask.sum().item())
+                valid_ids = original_ids[-valid_length:]
+                original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
+
+                assistant_marker = "<|im_start|>assistant"
+                if assistant_marker in original_prompt:
+                    insert_pos = original_prompt.rfind(assistant_marker)
+                    end_marker = "<|im_end|>"
+                    end_pos = original_prompt.rfind(end_marker, 0, insert_pos)
+                    if end_pos >= 0:
+                        modified_prompt = (
+                            original_prompt[:end_pos] + verify_text + original_prompt[end_pos:]
+                        )
+                    else:
+                        modified_prompt = (
+                            original_prompt[:insert_pos] + verify_text + "\n" + original_prompt[insert_pos:]
+                        )
+                else:
+                    modified_prompt = original_prompt + verify_text
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
@@ -188,6 +196,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         non_tensors = {}
         if "raw_prompt_ids" in gen_batch.non_tensor_batch:
             non_tensors["raw_prompt_ids"] = gen_batch.non_tensor_batch["raw_prompt_ids"][
+                np.array(low_indices)
+            ]
+        if "raw_prompt" in gen_batch.non_tensor_batch:
+            non_tensors["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"][
                 np.array(low_indices)
             ]
 
@@ -310,7 +322,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 else:
                     gen_batch = batch.pop(
                         batch_keys=["input_ids", "attention_mask", "position_ids"],
-                        non_tensor_batch_keys=["raw_prompt_ids"],
+                        non_tensor_batch_keys=["raw_prompt_ids", "raw_prompt"],
                         meta_info_keys=["do_vote"],
                     )
 

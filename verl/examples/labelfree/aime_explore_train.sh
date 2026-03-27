@@ -191,6 +191,7 @@ python -m verl.trainer.main_explore_ppo \
   data.max_response_length=$MAX_RESPONSE_LENGTH \
   data.train_batch_size=$DATA_TRAIN_BATCH_SIZE \
   data.filter_overlong_prompts=True \
+  data.return_raw_chat=True \
   actor_rollout_ref.model.path=$BACKBONE_PATH \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   actor_rollout_ref.model.use_remove_padding=True \
