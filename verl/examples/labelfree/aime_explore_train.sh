@@ -1,15 +1,28 @@
 #!/bin/bash
-
+"""
+CUDA_VISIBLE_DEVICES=2,3,4,5 bash examples/labelfree/aime_explore_train.sh --task AIME --backbone /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
+python /data/home/jianfeng/DIV-TTRL-PR/verl/scripts/model_merger.py \
+    --backend fsdp \
+    --local_dir /data/home/jianfeng/model/TTRL-AIME24/AIME-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/230602/global_step_45/actor \
+    --hf_model_path /data/home/jianfeng/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
+    --target_dir /data/home/jianfeng/model/aime_step_45_passk
+"""
 # AIME-TTT Exploration Training Script
 # Mirroring logic from examples/labelfree/aime25_train.sh
 
 # Usage:
 #     bash examples/labelfree/aime_explore_train.sh --backbone /path/to/model --clip-high --ent 0.003
 
-# === Environment Setup ===
-unset VLLM_ATTENTION_BACKEND
-export VLLM_USE_V1=1
 export WANDB_ENTITY=2691454060-ucla
+
+# API Self Verification configuration
+export USE_API_SELF_VERIFY=0
+export AUTODL_API_KEY="EMPTY"
+export AUTODL_MODEL="qwen3-4b-base"
+export AUTODL_BASE_URL="https://u630113-8ba4-8da84932.westc.seetacloud.com:8443/v1"
+export API_VERIFY_TOP_K=5
+export API_VERIFY_SC_THRESHOLD=0.3
+export API_VERIFY_MAX_WORKERS=8
 
 # === Parse command line arguments ===
 while [[ $# -gt 0 ]]; do
@@ -162,7 +175,7 @@ else
 fi
 # EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="checkpoints/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}-${TIMETAG}"
+OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 # === Run Training ===
 python -m verl.trainer.main_explore_ppo \
@@ -195,7 +208,7 @@ python -m verl.trainer.main_explore_ppo \
   actor_rollout_ref.rollout.temperature=$TEMP \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
   actor_rollout_ref.rollout.do_vote=True \
   actor_rollout_ref.rollout.n_vote=$N_VOTES_PER_PROMPT \
   actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
@@ -216,7 +229,7 @@ python -m verl.trainer.main_explore_ppo \
   trainer.n_gpus_per_node=8 \
   trainer.nnodes=1 \
   trainer.save_freq=15 \
-  trainer.test_freq=5 \
+  trainer.test_freq=2 \
   trainer.default_local_dir=$OUTPUT_DIR \
   trainer.total_epochs=$EPISODE "$@"
 

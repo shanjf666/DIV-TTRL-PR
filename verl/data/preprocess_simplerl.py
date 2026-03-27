@@ -40,7 +40,7 @@ def make_map_fn(split, source=None):
 if __name__ == '__main__':
 
     # Define all datasets to be processed
-    data_sources = ['AIME-TTT']
+    data_sources = ['GPQA-TTT', 'AIME-TTT', 'AIME25', 'AIME25-TTT', 'AMC-TTT', 'MATH-TTT']
     
     for data_source in data_sources:
         print(f"Processing dataset: {data_source}")
