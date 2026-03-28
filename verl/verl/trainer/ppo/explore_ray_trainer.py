@@ -72,11 +72,21 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         self.use_explore_rollout = getattr(self.config.algorithm, "use_explore_rollout", False)
         self.explore_threshold = getattr(self.config.algorithm, "explore_threshold", 0.5)
 
-        # Default self-verify prompt template. {majority_answer} will be replaced.
+        # Default system and user templates for exploration.
+        default_system = "You are an expert mathematical checker and solver. Carefully inspect suspicious solutions and re-solve problems correctly step by step."
         default_template = (
-            "\n\nA previous attempt suggests the answer might be: {majority_answer}\n"
-            "Please verify this answer by solving the problem again carefully. "
-            "If you agree, confirm the answer. If not, provide the correct answer."
+            "[Problem]\n"
+            "{problem}\n\n"
+            "[Previous Answer]\n"
+            "A previous attempt resulted in the following answer:\n"
+            "{majority_answer}\n\n"
+            "[Task]\n"
+            "Please solve the problem step by step.\n"
+            "IMPORTANT: The previous answer ({majority_answer}) is likely wrong due to low consistency. Please explore a completely different reasoning path and provide an alternative answer.\n"
+            "Conclude your final answer strictly enclosed in \\boxed{}."
+        )
+        self.explore_system_prompt = getattr(
+            self.config.algorithm, "explore_system_prompt", default_system
         )
         self.explore_prompt_template = getattr(
             self.config.algorithm, "explore_prompt_template", default_template
@@ -116,29 +126,39 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
             majority_answer = consistency_results[prompt_idx]["majority_answer"]
 
-            # Build the verify instruction
+            # Extract original problem from the prompt
+            # Try to extract the user's content between chat markers if present
+            problem_text = original_prompt
+            system_marker = "<|im_start|>system\n"
+            user_marker = "<|im_start|>user\n"
+            assistant_marker = "<|im_start|>assistant"
+            end_marker = "<|im_end|>\n"
+
+            if user_marker in original_prompt:
+                start_idx = original_prompt.find(user_marker) + len(user_marker)
+                end_idx = original_prompt.find(end_marker, start_idx)
+                if end_idx != -1:
+                    problem_text = original_prompt[start_idx:end_idx].strip()
+                else:
+                    problem_text = original_prompt[start_idx:].strip()
+            
+            # Format the target template
             verify_text = self.explore_prompt_template.format(
+                problem=problem_text,
                 majority_answer=str(majority_answer) if majority_answer is not None else "unknown"
             )
 
-            # Insert verify text before the assistant turn marker
-            assistant_marker = "<|im_start|>assistant"
-            if assistant_marker in original_prompt:
-                insert_pos = original_prompt.rfind(assistant_marker)
-                # Try to insert before the <|im_end|> that closes the user turn
-                end_marker = "<|im_end|>"
-                end_pos = original_prompt.rfind(end_marker, 0, insert_pos)
-                if end_pos >= 0:
-                    modified_prompt = (
-                        original_prompt[:end_pos] + verify_text + original_prompt[end_pos:]
-                    )
-                else:
-                    modified_prompt = (
-                        original_prompt[:insert_pos] + verify_text + "\n" + original_prompt[insert_pos:]
-                    )
+            # Reconstruct the prompt with the new System Prompt and User Template
+            if system_marker in original_prompt and user_marker in original_prompt:
+                # Proper ChatML format
+                modified_prompt = (
+                    f"{system_marker}{self.explore_system_prompt}{end_marker}"
+                    f"{user_marker}{verify_text}{end_marker}"
+                    f"{assistant_marker}\n"
+                )
             else:
-                # Fallback: append verify text at the end
-                modified_prompt = original_prompt + verify_text
+                # Fallback purely to Text completion
+                modified_prompt = f"System: {self.explore_system_prompt}\n\nUser: {verify_text}\n\nAssistant:\n"
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
@@ -242,6 +262,28 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             else:
                 # Use round-1 output
                 all_protos.append(gen_batch_output[start:end])
+
+        # Find the maximum dimensions for all 2D tensors to pad them safely
+        # keys usually are: 'responses', 'prompts', etc.
+        tensor_keys = list(all_protos[0].batch.keys())
+        max_shapes = {key: 0 for key in tensor_keys if all_protos[0].batch[key].dim() == 2}
+
+        # Calculate max sequence length for each 2D tensor
+        for proto in all_protos:
+            for key in max_shapes:
+                if proto.batch[key].shape[1] > max_shapes[key]:
+                    max_shapes[key] = proto.batch[key].shape[1]
+
+        # Pad all 2D tensors to match the max dimensions
+        for proto in all_protos:
+            for key in max_shapes:
+                tensor = proto.batch[key]
+                pad_len = max_shapes[key] - tensor.shape[1]
+                if pad_len > 0:
+                    # Pad on the right side with 0
+                    import torch.nn.functional as F
+                    padded_tensor = F.pad(tensor, (0, pad_len), value=self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None else 0)
+                    proto.batch[key] = padded_tensor
 
         merged = DataProto.concat(all_protos)
         return merged
@@ -395,9 +437,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     self.actor_rollout_wg.generate_sequences(explore_gen_batch_padded)
                                 )
 
-                                # Unpad
+                                # Unpad (must unpad padding prompts, taking N_votes into account!)
                                 explore_output = unpad_dataproto(
-                                    explore_output_padded, pad_size=explore_pad_size
+                                    explore_output_padded, pad_size=explore_pad_size * self.n_votes_per_prompt
                                 )
 
                                 # Merge: keep high-consistency R1, replace low-consistency with R2
@@ -493,11 +535,8 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     with _timer("adv", timing_raw):
                         # compute scores
                         if self.use_ttrl:
-                            sorted_indices = sorted(
-                                range(len(batch)),
-                                key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
-                            )
-                            batch = batch[sorted_indices]
+                            # Batch was already sorted globally at the start of step
+                            pass
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
