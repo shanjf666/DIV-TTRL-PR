@@ -91,7 +91,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
     # ------------------------------------------------------------------ #
     #  Helper: Build self-verify generation batch for low-consistency prompts
     # ------------------------------------------------------------------ #
-    def _build_explore_gen_batch(self, gen_batch, low_indices, consistency_results):
+    def _build_explore_gen_batch(self, gen_batch, low_indices, consistency_results, original_raw_prompts=None):
         """
         Build a new generation batch for low-consistency prompts with
         self-verify prompts injected.
@@ -100,6 +100,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             gen_batch: Original generation batch (batch_size prompts).
             low_indices: List of prompt indices that need round 2.
             consistency_results: List of dicts with majority_answer / consistency_rate.
+            original_raw_prompts: Pre-generation copy of raw_prompt messages (before vLLM interleave).
 
         Returns:
             DataProto: New batch ready for ``generate_sequences``.
@@ -112,10 +113,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             majority_answer = result.get("majority_answer", "None")
             verify_text = self.explore_prompt_template.format(majority_answer=majority_answer)
 
-            # Use raw_prompt (messages list) if available for cleaner templating
+            # Use saved original messages (before vLLM interleave corruption)
             messages = None
-            if "raw_prompt" in gen_batch.non_tensor_batch:
-                messages = list(gen_batch.non_tensor_batch["raw_prompt"][prompt_idx])
+            if original_raw_prompts is not None:
+                messages = list(original_raw_prompts[prompt_idx])
 
             if messages is not None:
                 # Add/Embed the verify text into the message list
@@ -213,6 +214,33 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
         return explore_batch
 
+    @staticmethod
+    def _pad_position_ids(position_ids, target_len):
+        """Pad position_ids by continuing the monotonic increase.
+
+        Flash Attention uses position_ids to detect sequence boundaries.
+        Padding with 0 would break monotonicity (e.g., [0,1,...,5119,0,0,0])
+        and cause a crash. Instead we continue: [0,1,...,5119,5120,5121,...].
+        """
+        if position_ids.shape[-1] >= target_len:
+            return position_ids
+        pad_len = target_len - position_ids.shape[-1]
+        # Take the last position value per row and continue incrementing
+        if position_ids.dim() == 2:
+            last_pos = position_ids[:, -1:]  # (batch, 1)
+            increments = torch.arange(1, pad_len + 1, device=position_ids.device).unsqueeze(0)  # (1, pad_len)
+            padding = last_pos + increments  # (batch, pad_len)
+        elif position_ids.dim() == 3:
+            # qwen2vl mrope: (batch, 3, seq_len)
+            last_pos = position_ids[:, :, -1:]  # (batch, 3, 1)
+            increments = torch.arange(1, pad_len + 1, device=position_ids.device).unsqueeze(0).unsqueeze(0)
+            padding = last_pos + increments
+        else:
+            # Fallback: just pad with 0
+            pad_shape = position_ids.shape[:-1] + (pad_len,)
+            padding = torch.zeros(pad_shape, dtype=position_ids.dtype, device=position_ids.device)
+        return torch.cat([position_ids, padding.to(position_ids.dtype)], dim=-1)
+
     # ------------------------------------------------------------------ #
     #  Helper: In-place replace low-consistency R1 slices with R2 outputs
     # ------------------------------------------------------------------ #
@@ -259,10 +287,20 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             r2_len = explore_output.batch[key].shape[1]
             max_len = max(r1_len, r2_len)
 
+            # Determine the correct pad value per key type
+            def _get_pad_val(k):
+                if "input_ids" in k:
+                    return self.tokenizer.pad_token_id
+                else:
+                    return 0  # attention_mask, responses, prompts, etc.
+
             # Pad R1 tensor if needed
             if r1_len < max_len:
-                pad_val = self.tokenizer.pad_token_id if "input_ids" in key else 0
-                gen_batch_output.batch[key] = _pad_to(tensor, max_len, pad_val)
+                if "position_ids" in key:
+                    # position_ids must stay monotonically increasing for Flash Attention
+                    gen_batch_output.batch[key] = self._pad_position_ids(tensor, max_len)
+                else:
+                    gen_batch_output.batch[key] = _pad_to(tensor, max_len, _get_pad_val(key))
 
             # Overwrite slices from R2
             for explore_pos, prompt_idx in enumerate(low_indices):
@@ -273,8 +311,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                 r2_slice = explore_output.batch[key][e_start:e_end]
                 if r2_slice.shape[1] < max_len:
-                    pad_val = self.tokenizer.pad_token_id if "input_ids" in key else 0
-                    r2_slice = _pad_to(r2_slice, max_len, pad_val)
+                    if "position_ids" in key:
+                        r2_slice = self._pad_position_ids(r2_slice, max_len)
+                    else:
+                        r2_slice = _pad_to(r2_slice, max_len, _get_pad_val(key))
                 
                 gen_batch_output.batch[key][r1_start:r1_end] = r2_slice
 
@@ -367,6 +407,12 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     # Round 1: Generate initial rollouts
                     # ============================================================
                     with _timer("gen", timing_raw):
+                        # Save original raw_prompts BEFORE generate_sequences
+                        # (vLLM mutates gen_batch.non_tensor_batch in-place: interleave + pop)
+                        original_raw_prompts = None
+                        if "raw_prompt" in gen_batch.non_tensor_batch:
+                            original_raw_prompts = gen_batch.non_tensor_batch["raw_prompt"].copy()
+
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
                             assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
@@ -426,7 +472,8 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                                 # Build self-verify prompts for low-consistency samples
                                 explore_gen_batch = self._build_explore_gen_batch(
-                                    gen_batch, low_indices, consistency_results
+                                    gen_batch, low_indices, consistency_results,
+                                    original_raw_prompts=original_raw_prompts,
                                 )
 
                                 # Pad for DP
