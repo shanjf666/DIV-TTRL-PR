@@ -72,11 +72,18 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         self.use_explore_rollout = getattr(self.config.algorithm, "use_explore_rollout", False)
         self.explore_threshold = getattr(self.config.algorithm, "explore_threshold", 0.5)
 
-        # Default self-verify prompt template. {majority_answer} will be replaced.
+        # Default self-verify prompt template. {problem} and {majority_answer} will be replaced.
         default_template = (
-            "\n\nA previous attempt suggests the answer might be: {majority_answer}\n"
-            "Please verify this answer by solving the problem again carefully. "
-            "If you agree, confirm the answer. If not, provide the correct answer."
+            "[Problem]\n"
+            "{problem}\n\n"
+            "[Previous Answer]\n"
+            "A previous attempt resulted in the following answer:\n"
+            "{majority_answer}\n\n"
+            "[Task]\n"
+            "Please solve the problem step by step.\n"
+            "IMPORTANT: The previous answer ({majority_answer}) is likely wrong due to low consistency. "
+            "Please explore a completely different reasoning path and provide an alternative answer.\n"
+            "Conclude your final answer strictly enclosed in \\boxed{{}}."
         )
         self.explore_prompt_template = getattr(
             self.config.algorithm, "explore_prompt_template", default_template
@@ -111,7 +118,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             # Get the majority answer to build the verification prompt
             result = consistency_results[prompt_idx]
             majority_answer = result.get("majority_answer", "None")
-            verify_text = self.explore_prompt_template.format(majority_answer=majority_answer)
 
             # Use saved original messages (before vLLM interleave corruption)
             messages = None
@@ -119,11 +125,18 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 messages = list(original_raw_prompts[prompt_idx])
 
             if messages is not None:
-                # Add/Embed the verify text into the message list
+                # Replace the original problem text with the fully structured template
                 new_messages = deepcopy(messages)
                 if new_messages and new_messages[-1]["role"] == "user":
-                    new_messages[-1]["content"] += "\n\n" + verify_text
+                    problem = new_messages[-1]["content"]
+                    new_messages[-1]["content"] = self.explore_prompt_template.format(
+                        problem=problem, majority_answer=majority_answer
+                    )
                 else:
+                    problem = new_messages[-1]["content"] if new_messages else ""
+                    verify_text = self.explore_prompt_template.format(
+                        problem=problem, majority_answer=majority_answer
+                    )
                     new_messages.append({"role": "user", "content": verify_text})
 
                 # Apply chat template with enable_thinking=False
@@ -138,6 +151,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 valid_ids = original_ids[-valid_length:]
                 original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
 
+                verify_text = self.explore_prompt_template.format(
+                    problem="", majority_answer=majority_answer
+                )
+
                 assistant_marker = "<|im_start|>assistant"
                 if assistant_marker in original_prompt:
                     insert_pos = original_prompt.rfind(assistant_marker)
@@ -145,14 +162,14 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     end_pos = original_prompt.rfind(end_marker, 0, insert_pos)
                     if end_pos >= 0:
                         modified_prompt = (
-                            original_prompt[:end_pos] + verify_text + original_prompt[end_pos:]
+                            original_prompt[:end_pos] + "\n\n" + verify_text + original_prompt[end_pos:]
                         )
                     else:
                         modified_prompt = (
-                            original_prompt[:insert_pos] + verify_text + "\n" + original_prompt[insert_pos:]
+                            original_prompt[:insert_pos] + "\n\n" + verify_text + "\n" + original_prompt[insert_pos:]
                         )
                 else:
-                    modified_prompt = original_prompt + verify_text
+                    modified_prompt = original_prompt + "\n\n" + verify_text
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
