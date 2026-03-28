@@ -385,6 +385,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     "max_tokens": 4096,
                                     "temperature": 0.6,
                                     "top_p": 0.95,
+                                    "n": self.n_votes_per_prompt,
                                 }
 
                                 # Pad for DP
@@ -399,9 +400,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     self.actor_rollout_wg.generate_sequences(explore_gen_batch_padded)
                                 )
 
-                                # Unpad
+                                # Unpad (must unpad by explore_pad_size * n because vLLM repeats sequences)
                                 explore_output = unpad_dataproto(
-                                    explore_output_padded, pad_size=explore_pad_size
+                                    explore_output_padded, pad_size=explore_pad_size * self.n_votes_per_prompt
                                 )
 
                                 # Extract R2 majority answers as pseudo-labels
