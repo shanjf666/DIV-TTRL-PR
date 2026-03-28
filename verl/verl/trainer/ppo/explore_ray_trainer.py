@@ -139,9 +139,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     )
                     new_messages.append({"role": "user", "content": verify_text})
 
-                # Apply chat template with enable_thinking=False
+                # Apply chat template (think mode enabled for R2)
                 modified_prompt = self.tokenizer.apply_chat_template(
-                    new_messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                    new_messages, add_generation_prompt=True, tokenize=False
                 )
             else:
                 # Original fallback: Manual string injection for Base models without full message history
