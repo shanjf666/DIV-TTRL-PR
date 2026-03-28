@@ -139,9 +139,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     )
                     new_messages.append({"role": "user", "content": verify_text})
 
-                # Apply chat template (think mode enabled for R2)
+                # Apply chat template (think mode disabled for R2 to avoid OOM)
                 modified_prompt = self.tokenizer.apply_chat_template(
-                    new_messages, add_generation_prompt=True, tokenize=False
+                    new_messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
                 )
             else:
                 # Original fallback: Manual string injection for Base models without full message history
@@ -382,7 +382,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                                 # Configure custom generation parameters for Round 2
                                 explore_gen_batch.meta_info["sampling_kwargs"] = {
-                                    "max_tokens": 14336,
+                                    "max_tokens": 4096,
                                     "temperature": 0.6,
                                     "top_p": 0.95,
                                 }
