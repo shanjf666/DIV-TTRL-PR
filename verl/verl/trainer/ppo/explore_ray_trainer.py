@@ -291,13 +291,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                 batch.meta_info["do_vote"] = False
                 if self.use_ttrl:
-                    # Sort batch right at the beginning by index so EVERYTHING downstream (gen_batch, gen_batch_output, tmp_batch) is perfectly aligned
-                    sorted_indices = sorted(
-                        range(len(batch)),
-                        key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
-                    )
-                    batch = batch[sorted_indices]
-
                     self.config.actor_rollout_ref.rollout.n = self.n_votes_per_prompt
                     batch.meta_info["do_vote"] = True
 
@@ -347,7 +340,15 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             )
                             tmp_batch = tmp_batch.union(gen_batch_output)
 
-                            # Compute consistency per prompt (native order is preserved since batch was sorted upfront)
+                            # Sort by index for correct per-prompt grouping (if multiple entries of same prompt exist)
+                            # Note: This is local to tmp_batch so it doesn't affect the Actor training order
+                            sorted_indices = sorted(
+                                range(len(tmp_batch)),
+                                key=lambda i: tmp_batch[i].non_tensor_batch["extra_info"]["index"],
+                            )
+                            tmp_batch = tmp_batch[sorted_indices]
+
+                            # Compute consistency per prompt
                             consistency_results = self.reward_fn.compute_majority_and_consistency(
                                 tmp_batch
                             )
@@ -402,10 +403,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     )
                                 )
 
-                                # Generate round-2 responses
-                                explore_output_padded = (
-                                    self.actor_rollout_wg.generate_sequences(explore_gen_batch_padded)
-                                )
+                                # Generate round-2 responses (disable gradient tracking for efficiency)
+                                with torch.no_grad():
+                                    explore_output_padded = (
+                                        self.actor_rollout_wg.generate_sequences(explore_gen_batch_padded)
+                                    )
 
                                 # Unpad (must unpad by explore_pad_size * n because vLLM repeats sequences)
                                 explore_output = unpad_dataproto(
