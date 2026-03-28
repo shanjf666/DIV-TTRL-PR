@@ -314,6 +314,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                         if "raw_prompt" in gen_batch.non_tensor_batch:
                             original_raw_prompts = gen_batch.non_tensor_batch["raw_prompt"].copy()
 
+                        if self.use_ttrl:
+                            gen_batch.meta_info["sampling_kwargs"] = {"n": self.n_votes_per_prompt}
+
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
                             assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt

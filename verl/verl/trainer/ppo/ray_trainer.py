@@ -1060,6 +1060,8 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
+                        if self.use_ttrl:
+                            gen_batch.meta_info["sampling_kwargs"] = {"n": self.n_votes_per_prompt}
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
                             assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
