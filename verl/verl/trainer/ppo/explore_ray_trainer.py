@@ -284,6 +284,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                 batch.meta_info["do_vote"] = False
                 if self.use_ttrl:
+                    # Sort batch right at the beginning by index so EVERYTHING downstream (gen_batch, gen_batch_output, tmp_batch) is perfectly aligned
+                    sorted_indices = sorted(
+                        range(len(batch)),
+                        key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
+                    )
+                    batch = batch[sorted_indices]
+
                     self.config.actor_rollout_ref.rollout.n = self.n_votes_per_prompt
                     batch.meta_info["do_vote"] = True
 
@@ -333,14 +340,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             )
                             tmp_batch = tmp_batch.union(gen_batch_output)
 
-                            # Sort by index for correct per-prompt grouping
-                            sorted_indices = sorted(
-                                range(len(tmp_batch)),
-                                key=lambda i: tmp_batch[i].non_tensor_batch["extra_info"]["index"],
-                            )
-                            tmp_batch = tmp_batch[sorted_indices]
-
-                            # Compute consistency per prompt
+                            # Compute consistency per prompt (native order is preserved since batch was sorted upfront)
                             consistency_results = self.reward_fn.compute_majority_and_consistency(
                                 tmp_batch
                             )
