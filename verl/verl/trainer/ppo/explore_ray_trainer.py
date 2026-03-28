@@ -214,122 +214,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
         return explore_batch
 
-    @staticmethod
-    def _pad_position_ids(position_ids, target_len):
-        """Pad position_ids by continuing the monotonic increase.
-
-        Flash Attention uses position_ids to detect sequence boundaries.
-        Padding with 0 would break monotonicity (e.g., [0,1,...,5119,0,0,0])
-        and cause a crash. Instead we continue: [0,1,...,5119,5120,5121,...].
-        """
-        if position_ids.shape[-1] >= target_len:
-            return position_ids
-        pad_len = target_len - position_ids.shape[-1]
-        # Take the last position value per row and continue incrementing
-        if position_ids.dim() == 2:
-            last_pos = position_ids[:, -1:]  # (batch, 1)
-            increments = torch.arange(1, pad_len + 1, device=position_ids.device).unsqueeze(0)  # (1, pad_len)
-            padding = last_pos + increments  # (batch, pad_len)
-        elif position_ids.dim() == 3:
-            # qwen2vl mrope: (batch, 3, seq_len)
-            last_pos = position_ids[:, :, -1:]  # (batch, 3, 1)
-            increments = torch.arange(1, pad_len + 1, device=position_ids.device).unsqueeze(0).unsqueeze(0)
-            padding = last_pos + increments
-        else:
-            # Fallback: just pad with 0
-            pad_shape = position_ids.shape[:-1] + (pad_len,)
-            padding = torch.zeros(pad_shape, dtype=position_ids.dtype, device=position_ids.device)
-        return torch.cat([position_ids, padding.to(position_ids.dtype)], dim=-1)
-
-    # ------------------------------------------------------------------ #
-    #  Helper: In-place replace low-consistency R1 slices with R2 outputs
-    # ------------------------------------------------------------------ #
-    def _merge_explore_outputs(
-        self,
-        gen_batch_output,
-        explore_output,
-        high_indices,
-        low_indices,
-        n_votes_per_prompt,
-    ):
-        """
-        In-place replacement: directly overwrite the low-consistency prompt
-        slices in gen_batch_output with the Round-2 explore_output.
-
-        Handles sequence length padding on a per-key basis to avoid RuntimeError.
-        """
-        if not low_indices or explore_output is None:
-            return gen_batch_output
-
-        # Helper: pad a single tensor along dim=1 to target_len
-        def _pad_to(tensor, target, pad_val=0):
-            if tensor.shape[1] >= target:
-                return tensor
-            pad_shape = (tensor.shape[0], target - tensor.shape[1]) + tensor.shape[2:]
-            padding = torch.full(pad_shape, pad_val, dtype=tensor.dtype, device=tensor.device)
-            return torch.cat([tensor, padding], dim=1)
-
-        # Step 1: Handle tensors in batch per-key
-        for key in gen_batch_output.batch.keys():
-            tensor = gen_batch_output.batch[key]
-            if tensor.dim() < 2:
-                # For 1D tensors, just overwrite slices directly
-                for explore_pos, prompt_idx in enumerate(low_indices):
-                    r1_start = prompt_idx * n_votes_per_prompt
-                    r1_end = r1_start + n_votes_per_prompt
-                    e_start = explore_pos * n_votes_per_prompt
-                    e_end = e_start + n_votes_per_prompt
-                    gen_batch_output.batch[key][r1_start:r1_end] = explore_output.batch[key][e_start:e_end]
-                continue
-
-            # For 2D+ tensors, we must check sequence length (dim=1)
-            r1_len = tensor.shape[1]
-            r2_len = explore_output.batch[key].shape[1]
-            max_len = max(r1_len, r2_len)
-
-            # Determine the correct pad value per key type
-            def _get_pad_val(k):
-                if "input_ids" in k:
-                    return self.tokenizer.pad_token_id
-                else:
-                    return 0  # attention_mask, responses, prompts, etc.
-
-            # Pad R1 tensor if needed
-            if r1_len < max_len:
-                if "position_ids" in key:
-                    # position_ids must stay monotonically increasing for Flash Attention
-                    gen_batch_output.batch[key] = self._pad_position_ids(tensor, max_len)
-                else:
-                    gen_batch_output.batch[key] = _pad_to(tensor, max_len, _get_pad_val(key))
-
-            # Overwrite slices from R2
-            for explore_pos, prompt_idx in enumerate(low_indices):
-                r1_start = prompt_idx * n_votes_per_prompt
-                r1_end = r1_start + n_votes_per_prompt
-                e_start = explore_pos * n_votes_per_prompt
-                e_end = e_start + n_votes_per_prompt
-
-                r2_slice = explore_output.batch[key][e_start:e_end]
-                if r2_slice.shape[1] < max_len:
-                    if "position_ids" in key:
-                        r2_slice = self._pad_position_ids(r2_slice, max_len)
-                    else:
-                        r2_slice = _pad_to(r2_slice, max_len, _get_pad_val(key))
-                
-                gen_batch_output.batch[key][r1_start:r1_end] = r2_slice
-
-        # Step 2: Handle non-tensor batch entries
-        for key in gen_batch_output.non_tensor_batch.keys():
-            if key in explore_output.non_tensor_batch:
-                for explore_pos, prompt_idx in enumerate(low_indices):
-                    r1_start = prompt_idx * n_votes_per_prompt
-                    r1_end = r1_start + n_votes_per_prompt
-                    e_start = explore_pos * n_votes_per_prompt
-                    e_end = e_start + n_votes_per_prompt
-                    gen_batch_output.non_tensor_batch[key][r1_start:r1_end] = \
-                        explore_output.non_tensor_batch[key][e_start:e_end]
-
-        return gen_batch_output
 
 
     # ------------------------------------------------------------------ #
@@ -463,9 +347,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 f"prompts ({round2_ratio:.2%}), threshold={self.explore_threshold}"
                             )
 
-                            # --- Round 2 Rollout (if needed) ---
+                            # --- Round 2: Extract pseudo-labels (if needed) ---
                             if low_indices:
-                                # Clean up temporary batch before generating Round 2 to save memory
+                                # Clean up tmp_batch before generating R2
                                 del tmp_batch
                                 gc.collect()
                                 torch.cuda.empty_cache()
@@ -493,17 +377,42 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     explore_output_padded, pad_size=explore_pad_size
                                 )
 
-                                # Merge: keep high-consistency R1, replace low-consistency with R2
-                                gen_batch_output = self._merge_explore_outputs(
-                                    gen_batch_output,
-                                    explore_output,
-                                    high_indices,
-                                    low_indices,
-                                    self.n_votes_per_prompt,
+                                # Extract R2 majority answers as pseudo-labels
+                                # Build metadata batch from original batch for low-consistency prompts
+                                low_batch_indices = [i for i in low_indices]
+                                r2_meta_batch = batch[low_batch_indices]
+                                r2_meta_batch = r2_meta_batch.repeat(
+                                    repeat_times=self.n_votes_per_prompt, interleave=True
                                 )
+                                r2_eval_batch = r2_meta_batch.union(explore_output)
+
+                                r2_consistency = self.reward_fn.compute_majority_and_consistency(
+                                    r2_eval_batch
+                                )
+
+                                # Inject R2 majority as verified labels into gen_batch_output
+                                # gen_batch_output has n_prompts * n_votes rows
+                                total_samples = len(gen_batch_output)
+                                explore_labels = np.array([None] * total_samples, dtype=object)
+
+                                for r2_idx, prompt_idx in enumerate(low_indices):
+                                    r2_majority = r2_consistency[r2_idx]["majority_answer"]
+                                    r2_rate = r2_consistency[r2_idx]["consistency_rate"]
+                                    start = prompt_idx * self.n_votes_per_prompt
+                                    end = start + self.n_votes_per_prompt
+                                    explore_labels[start:end] = r2_majority
+                                    print(
+                                        f"  [Explore] Prompt {prompt_idx}: "
+                                        f"R1 majority='{consistency_results[prompt_idx]['majority_answer']}' "
+                                        f"(sc={consistency_results[prompt_idx]['consistency_rate']:.2f}) → "
+                                        f"R2 majority='{r2_majority}' (sc={r2_rate:.2f})"
+                                    )
+
+                                gen_batch_output.non_tensor_batch["explore_verified_label"] = explore_labels
 
                                 del explore_gen_batch, explore_gen_batch_padded
                                 del explore_output_padded, explore_output
+                                del r2_meta_batch, r2_eval_batch
                                 gc.collect()
                                 torch.cuda.empty_cache()
                             else:

@@ -347,10 +347,15 @@ class TTRLRewardManager:
                             offline_voted_answer = candidate
                             break
                 
-                # 3. Hybrid logic: If online consistency is low, fallback to offline label
+                # 3. Explore-verified label (highest priority: from Two-Stage Exploration R2)
                 verified_label = None
                 off_policy = 0.0
-                if self.enable_hybrid and online_consistency_rate < 0.3:
+                explore_label = data_item.non_tensor_batch.get("explore_verified_label")
+                if explore_label is not None:
+                    verified_label = explore_label
+                    off_policy = 1.0
+                # 4. Hybrid logic: If online consistency is low, fallback to offline label
+                elif self.enable_hybrid and online_consistency_rate < 0.3:
                     if offline_voted_answer:
                         verified_label = offline_voted_answer
                         off_policy = 1.0
