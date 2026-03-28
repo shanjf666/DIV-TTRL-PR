@@ -227,25 +227,26 @@ class vLLMRollout(BaseRollout):
                     f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
                 )
 
+        kwargs = prompts.meta_info.get("sampling_kwargs", {}).copy()
+
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
-            kwargs = {
+            kwargs.update({
                 "best_of": 1,
                 "top_p": 1.0,
                 "top_k": -1,
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
-            }
+            })
         elif is_validate:
-            # TODO: try **
-            kwargs = {
+            kwargs.update({
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
-            }
+            })
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):

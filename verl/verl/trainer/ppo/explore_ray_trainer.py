@@ -377,6 +377,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     original_raw_prompts=original_raw_prompts,
                                 )
 
+                                # Configure custom generation parameters for Round 2
+                                explore_gen_batch.meta_info["sampling_kwargs"] = {
+                                    "max_tokens": 14336,
+                                    "temperature": 0.6,
+                                    "top_p": 0.95,
+                                }
+
                                 # Pad for DP
                                 explore_gen_batch_padded, explore_pad_size = (
                                     pad_dataproto_to_divisor(
