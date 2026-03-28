@@ -264,7 +264,10 @@ class vLLMRollout(BaseRollout):
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
 
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
+            # Pad to a globally consistent maximum length to prevent DP concatenation crashes.
+            # If 'max_tokens' was dynamically injected, we use that as the target shape.
+            pad_max_len = kwargs.get("max_tokens", self.config.response_length)
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=pad_max_len).to(
                 idx.device
             )
 
