@@ -89,10 +89,17 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             self.config.algorithm, "explore_prompt_template", default_template
         )
 
+        self.explore_max_tokens = getattr(self.config.algorithm, "explore_max_tokens", 4096)
+        self.explore_temperature = getattr(self.config.algorithm, "explore_temperature", 0.6)
+        self.explore_top_p = getattr(self.config.algorithm, "explore_top_p", 0.95)
+
         if self.use_explore_rollout:
             print(
                 f"[RayExplorePPOTrainer] Exploration mode enabled: "
-                f"threshold={self.explore_threshold}"
+                f"threshold={self.explore_threshold}, "
+                f"max_tokens={self.explore_max_tokens}, "
+                f"temperature={self.explore_temperature}, "
+                f"top_p={self.explore_top_p}"
             )
 
     # ------------------------------------------------------------------ #
@@ -382,9 +389,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                                 # Configure custom generation parameters for Round 2
                                 explore_gen_batch.meta_info["sampling_kwargs"] = {
-                                    "max_tokens": 4096,
-                                    "temperature": 0.6,
-                                    "top_p": 0.95,
+                                    "max_tokens": self.explore_max_tokens,
+                                    "temperature": self.explore_temperature,
+                                    "top_p": self.explore_top_p,
                                     "n": self.n_votes_per_prompt,
                                 }
 
@@ -768,6 +775,16 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(
                                     batch.meta_info[pp_key]
                                 )
+
+                    # Clear large unabridged tensors generated during rollout to free GPU PyTorch memory before FSDP backward passes
+                    if self.use_ttrl:
+                        if "gen_batch_output" in locals(): del gen_batch_output
+                        if "old_log_prob" in locals(): del old_log_prob
+                        if "ref_log_prob" in locals(): del ref_log_prob
+                        if "values" in locals(): del values
+                        if "reward_tensor" in locals(): del reward_tensor
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
                     # update critic
                     if self.use_critic:

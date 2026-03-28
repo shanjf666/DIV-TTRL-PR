@@ -1336,6 +1336,16 @@ class RayPPOTrainer:
                             if pp_key in batch.meta_info:
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(batch.meta_info[pp_key])
 
+                    # Clear large unabridged tensors generated during rollout to free GPU PyTorch memory before FSDP backward passes
+                    if self.use_ttrl:
+                        if "gen_batch_output" in locals(): del gen_batch_output
+                        if "old_log_prob" in locals(): del old_log_prob
+                        if "ref_log_prob" in locals(): del ref_log_prob
+                        if "values" in locals(): del values
+                        if "reward_tensor" in locals(): del reward_tensor
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
