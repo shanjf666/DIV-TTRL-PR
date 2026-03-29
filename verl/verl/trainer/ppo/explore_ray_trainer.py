@@ -82,8 +82,8 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             "{majority_answer}\n\n"
             "[Task]\n"
             "Please solve the problem step by step.\n"
-            "IMPORTANT: The previous answer ({majority_answer}) is likely wrong due to low consistency. Please explore a completely different reasoning path and provide an alternative answer.\n"
-            "Conclude your final answer strictly enclosed in \\boxed{}."
+            "IMPORTANT: The previous answer is likely wrong due to low consistency. Please explore a completely different reasoning path and provide an alternative answer.\n"
+            "Conclude your final answer strictly enclosed in \\boxed{{}}."
         )
         self.explore_system_prompt = getattr(
             self.config.algorithm, "explore_system_prompt", default_system
@@ -99,12 +99,102 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             )
 
     # ------------------------------------------------------------------ #
+    #  Helper: Detect chat template format from tokenizer or prompt
+    # ------------------------------------------------------------------ #
+    def _detect_chat_format(self, prompt_text: str) -> dict:
+        """
+        Detect the chat template format used in the prompt.
+        Returns a dict with markers for system, user, assistant, and end tokens.
+        
+        Supports: ChatML (Qwen), Llama-3, Gemma, and fallback to plain text.
+        """
+        # ChatML format (Qwen, etc.)
+        if "<|im_start|>" in prompt_text:
+            return {
+                "format": "chatml",
+                "system_start": "<|im_start|>system\n",
+                "user_start": "<|im_start|>user\n", 
+                "assistant_start": "<|im_start|>assistant\n",
+                "end": "<|im_end|>\n",
+            }
+        # Llama-3 format
+        elif "<|start_header_id|>" in prompt_text:
+            return {
+                "format": "llama3",
+                "system_start": "<|start_header_id|>system<|end_header_id|>\n\n",
+                "user_start": "<|start_header_id|>user<|end_header_id|>\n\n",
+                "assistant_start": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "end": "<|eot_id|>",
+            }
+        # Gemma format
+        elif "<start_of_turn>" in prompt_text:
+            return {
+                "format": "gemma",
+                "system_start": "",  # Gemma doesn't have system role
+                "user_start": "<start_of_turn>user\n",
+                "assistant_start": "<start_of_turn>model\n",
+                "end": "<end_of_turn>\n",
+            }
+        # Plain text fallback
+        else:
+            return {
+                "format": "plain",
+                "system_start": "System: ",
+                "user_start": "\n\nUser: ",
+                "assistant_start": "\n\nAssistant: ",
+                "end": "\n",
+            }
+
+    # ------------------------------------------------------------------ #
+    #  Helper: Smart truncation that avoids breaking LaTeX/code
+    # ------------------------------------------------------------------ #
+    def _smart_truncate(self, text: str, max_chars: int) -> str:
+        """
+        Truncate text intelligently, avoiding breaks in LaTeX formulas or code blocks.
+        Tries to find a safe truncation point (sentence end, paragraph, etc.).
+        """
+        if len(text) <= max_chars:
+            return text
+        
+        # Try to find a safe truncation point
+        truncated = text[:max_chars]
+        
+        # Look for safe break points (in order of preference)
+        safe_breaks = [
+            "\n\n",      # Paragraph break
+            ".\n",       # Sentence end with newline  
+            ". ",        # Sentence end
+            "}\n",       # End of LaTeX block
+            "$$\n",      # End of display math
+            "$\n",       # End of inline math
+            "\n",        # Line break
+        ]
+        
+        best_break = -1
+        for break_str in safe_breaks:
+            pos = truncated.rfind(break_str)
+            if pos > max_chars * 0.5:  # Only accept if we keep at least 50%
+                best_break = pos + len(break_str)
+                break
+        
+        if best_break > 0:
+            return truncated[:best_break].rstrip() + "\n... (truncated)"
+        else:
+            # Fallback: just truncate but add indicator
+            return truncated.rstrip() + "... (truncated)"
+
+    # ------------------------------------------------------------------ #
     #  Helper: Build self-verify generation batch for low-consistency prompts
     # ------------------------------------------------------------------ #
     def _build_explore_gen_batch(self, gen_batch, low_indices, consistency_results):
         """
         Build a new generation batch for low-consistency prompts with
         self-verify prompts injected.
+        
+        CRITICAL: The generated verify prompts MUST NOT exceed the original R1
+        prompt length to prevent PPO gradient errors. If the verify prompt would
+        be longer, we truncate it here (before generation) rather than after,
+        ensuring generation and log_prob computation see the same prompt.
 
         Args:
             gen_batch: Original generation batch (batch_size prompts).
@@ -114,6 +204,9 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         Returns:
             DataProto: New batch ready for ``generate_sequences``.
         """
+        # Get the target prompt length from R1 (this is the maximum allowed)
+        r1_prompt_len = gen_batch.batch["input_ids"].shape[1]
+        
         new_input_ids_list = []
 
         for prompt_idx in low_indices:
@@ -126,15 +219,15 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
             majority_answer = consistency_results[prompt_idx]["majority_answer"]
 
-            # Extract original problem from the prompt
-            # Try to extract the user's content between chat markers if present
+            # Detect chat format dynamically (supports ChatML, Llama-3, Gemma, plain)
+            chat_format = self._detect_chat_format(original_prompt)
+            
+            # Extract original problem from the prompt using detected format
             problem_text = original_prompt
-            system_marker = "<|im_start|>system\n"
-            user_marker = "<|im_start|>user\n"
-            assistant_marker = "<|im_start|>assistant"
-            end_marker = "<|im_end|>\n"
-
-            if user_marker in original_prompt:
+            user_marker = chat_format["user_start"]
+            end_marker = chat_format["end"]
+            
+            if user_marker and user_marker in original_prompt:
                 start_idx = original_prompt.find(user_marker) + len(user_marker)
                 end_idx = original_prompt.find(end_marker, start_idx)
                 if end_idx != -1:
@@ -142,37 +235,127 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 else:
                     problem_text = original_prompt[start_idx:].strip()
             
+            # Smart truncation of majority_answer to prevent OOM
+            # Use smart truncation that avoids breaking LaTeX/code
+            max_ans_chars = 1500  # Reduced to leave room for verify template
+            ans_str = str(majority_answer) if majority_answer is not None else "unknown"
+            ans_str = self._smart_truncate(ans_str, max_ans_chars)
+                
             # Format the target template
             verify_text = self.explore_prompt_template.format(
                 problem=problem_text,
-                majority_answer=str(majority_answer) if majority_answer is not None else "unknown"
+                majority_answer=ans_str
             )
 
-            # Reconstruct the prompt with the new System Prompt and User Template
-            if system_marker in original_prompt and user_marker in original_prompt:
-                # Proper ChatML format
+            # Reconstruct the prompt using detected format
+            if chat_format["format"] == "chatml":
                 modified_prompt = (
-                    f"{system_marker}{self.explore_system_prompt}{end_marker}"
-                    f"{user_marker}{verify_text}{end_marker}"
-                    f"{assistant_marker}\n"
+                    f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                    f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
+                )
+            elif chat_format["format"] == "llama3":
+                modified_prompt = (
+                    f"<|begin_of_text|>"
+                    f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                    f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
+                )
+            elif chat_format["format"] == "gemma":
+                # Gemma doesn't have system role, include it in user message
+                modified_prompt = (
+                    f"<bos>"
+                    f"{chat_format['user_start']}{self.explore_system_prompt}\n\n{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
                 )
             else:
-                # Fallback purely to Text completion
-                modified_prompt = f"System: {self.explore_system_prompt}\n\nUser: {verify_text}\n\nAssistant:\n"
+                # Plain text fallback
+                modified_prompt = (
+                    f"System: {self.explore_system_prompt}\n\n"
+                    f"User: {verify_text}\n\n"
+                    f"Assistant: "
+                )
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
+            
+            # CRITICAL: Ensure verify prompt doesn't exceed R1 prompt length
+            # This prevents the PPO gradient error where generation uses a different
+            # prompt than log_prob computation
+            if len(new_ids) > r1_prompt_len:
+                print(
+                    f"[Explore] WARNING: Verify prompt ({len(new_ids)} tokens) exceeds "
+                    f"R1 prompt length ({r1_prompt_len}). Truncating to prevent PPO gradient error."
+                )
+                # Truncate from the middle of the problem_text to preserve structure
+                # We need to reduce by (len(new_ids) - r1_prompt_len) tokens
+                excess_tokens = len(new_ids) - r1_prompt_len + 50  # +50 buffer
+                
+                # Estimate chars to remove (rough: 1 token ≈ 4 chars)
+                chars_to_remove = excess_tokens * 4
+                
+                # Truncate problem_text (the longest part)
+                if len(problem_text) > chars_to_remove + 100:
+                    problem_text = self._smart_truncate(
+                        problem_text, 
+                        len(problem_text) - chars_to_remove
+                    )
+                    
+                    # Rebuild and re-tokenize
+                    verify_text = self.explore_prompt_template.format(
+                        problem=problem_text,
+                        majority_answer=ans_str
+                    )
+                    
+                    if chat_format["format"] == "chatml":
+                        modified_prompt = (
+                            f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                            f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                            f"{chat_format['assistant_start']}"
+                        )
+                    elif chat_format["format"] == "llama3":
+                        modified_prompt = (
+                            f"<|begin_of_text|>"
+                            f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                            f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                            f"{chat_format['assistant_start']}"
+                        )
+                    elif chat_format["format"] == "gemma":
+                        modified_prompt = (
+                            f"<bos>"
+                            f"{chat_format['user_start']}{self.explore_system_prompt}\n\n{verify_text}{chat_format['end']}"
+                            f"{chat_format['assistant_start']}"
+                        )
+                    else:
+                        modified_prompt = (
+                            f"System: {self.explore_system_prompt}\n\n"
+                            f"User: {verify_text}\n\n"
+                            f"Assistant: "
+                        )
+                    
+                    new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
+                
+                # Final safety: hard truncate if still too long
+                if len(new_ids) > r1_prompt_len:
+                    new_ids = new_ids[-r1_prompt_len:]  # Keep the end (assistant marker)
+            
             new_input_ids_list.append(torch.tensor(new_ids, dtype=torch.long))
 
             # Print first modified prompt for debugging
             if prompt_idx == low_indices[0]:
                 print(f"[Explore] Modified prompt (first sample, idx={prompt_idx}):")
-                print(f"  Original length: {valid_length}, New length: {len(new_ids)}")
+                print(f"  Original length: {valid_length}, New length: {len(new_ids)}, Max allowed: {r1_prompt_len}")
+                print(f"  Chat format: {chat_format['format']}")
                 # Print the last 200 chars to verify injection
                 print(f"  ...{modified_prompt[-200:]}")
 
         # Pad to same length (left-pad with pad_token_id)
+        # Use R1 prompt length as target to ensure consistency
+        target_len = r1_prompt_len
         max_len = max(len(ids) for ids in new_input_ids_list)
+        # Ensure we pad to at least target_len for proper merge later
+        max_len = max(max_len, target_len)
+        
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
         padded_input_ids = []
@@ -189,7 +372,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 torch.zeros(pad_len, dtype=torch.long),
                 torch.ones(len(ids), dtype=torch.long),
             ])
-            pos_ids = torch.arange(max_len, dtype=torch.long)
+            # position_ids MUST start at 0 for the first valid token
+            pos_ids = torch.cat([
+                torch.zeros(pad_len, dtype=torch.long),
+                torch.arange(len(ids), dtype=torch.long),
+            ])
 
             padded_input_ids.append(padded)
             attention_masks.append(mask)
@@ -208,6 +395,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         non_tensors = {}
         if "raw_prompt_ids" in gen_batch.non_tensor_batch:
             non_tensors["raw_prompt_ids"] = gen_batch.non_tensor_batch["raw_prompt_ids"][
+                np.array(low_indices)
+            ]
+        
+        # CRITICAL: Carry over extra_info for the selected indices
+        # This ensures explore_output has correct index information after generation
+        if "extra_info" in gen_batch.non_tensor_batch:
+            non_tensors["extra_info"] = gen_batch.non_tensor_batch["extra_info"][
                 np.array(low_indices)
             ]
 
@@ -355,6 +549,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                         non_tensor_batch_keys=["raw_prompt_ids"],
                         meta_info_keys=["do_vote"],
                     )
+                
+                # Copy extra_info to gen_batch without removing it from batch
+                # gen_batch needs it for _build_explore_gen_batch, batch needs it for sorting
+                if "extra_info" in batch.non_tensor_batch:
+                    gen_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
@@ -380,11 +579,32 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             tmp_batch = tmp_batch.union(gen_batch_output)
 
                             # Sort by index for correct per-prompt grouping
+                            # This sorted order will be used for ALL subsequent operations
                             sorted_indices = sorted(
                                 range(len(tmp_batch)),
                                 key=lambda i: tmp_batch[i].non_tensor_batch["extra_info"]["index"],
                             )
                             tmp_batch = tmp_batch[sorted_indices]
+                            
+                            # CRITICAL: Use the SAME sorted_indices to reorder gen_batch_output
+                            # gen_batch_output itself doesn't have extra_info, but tmp_batch.union()
+                            # gave it the same ordering as batch.repeat(). So sorted_indices applies.
+                            gen_batch_output = gen_batch_output[sorted_indices]
+                            
+                            # Also sort gen_batch and batch to align indices for _build_explore_gen_batch
+                            # gen_batch has extra_info (it's a subset of batch)
+                            gen_batch_sorted_indices = sorted(
+                                range(len(gen_batch)),
+                                key=lambda i: gen_batch[i].non_tensor_batch["extra_info"]["index"],
+                            )
+                            gen_batch = gen_batch[gen_batch_sorted_indices]
+                            
+                            # Also sort `batch` to match for later batch.repeat().union()
+                            batch_sorted_indices = sorted(
+                                range(len(batch)),
+                                key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
+                            )
+                            batch = batch[batch_sorted_indices]
 
                             # Compute consistency per prompt
                             consistency_results = self.reward_fn.compute_majority_and_consistency(
@@ -392,6 +612,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             )
 
                             # --- Split into high / low consistency ---
+                            # Now indices refer to sorted order (gen_batch, gen_batch_output, batch are ALL sorted)
                             high_indices = []
                             low_indices = []
                             prompt_num = len(consistency_results)
@@ -535,8 +756,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     with _timer("adv", timing_raw):
                         # compute scores
                         if self.use_ttrl:
-                            # Batch was already sorted globally at the start of step
-                            pass
+                            # Re-sort batch by index to ensure correct per-prompt grouping
+                            # This is critical after explore merge which may change order
+                            sorted_indices = sorted(
+                                range(len(batch)),
+                                key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
+                            )
+                            batch = batch[sorted_indices]
                         if self.use_rm:
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
