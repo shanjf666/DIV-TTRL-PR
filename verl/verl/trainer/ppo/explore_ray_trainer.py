@@ -663,6 +663,25 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     explore_output_padded, pad_size=explore_pad_size * self.n_votes_per_prompt
                                 )
 
+                                # --- Compute accuracy gap between R1 and R2 for low-consistency samples ---
+                                try:
+                                    r1_protos = []
+                                    for idx in low_indices:
+                                        r1_protos.append(gen_batch_output[idx * self.n_votes_per_prompt : (idx + 1) * self.n_votes_per_prompt])
+                                    r1_outputs = DataProto.concat(r1_protos)
+                                    r1_low_batch = batch[low_indices].repeat(repeat_times=self.n_votes_per_prompt, interleave=True).union(r1_outputs)
+                                    if hasattr(self.reward_fn, 'compute_accuracy'):
+                                        r1_acc = self.reward_fn.compute_accuracy(r1_low_batch)
+                                        r2_low_batch = batch[low_indices].repeat(repeat_times=self.n_votes_per_prompt, interleave=True).union(explore_output)
+                                        r2_acc = self.reward_fn.compute_accuracy(r2_low_batch)
+
+                                        metrics["explore/r1_low_consistency_acc"] = r1_acc
+                                        metrics["explore/r2_low_consistency_acc"] = r2_acc
+                                        metrics["explore/r2_r1_acc_gap"] = r2_acc - r1_acc
+                                        print(f"[Explore] Accuracy for low-consistency prompts: R1={r1_acc:.2%}, R2={r2_acc:.2%}, Gap={(r2_acc - r1_acc):.2%}")
+                                except Exception as e:
+                                    print(f"[Explore] WARNING: Failed to compute accuracy gap: {e}")
+
                                 # Merge: keep high-consistency R1, replace low-consistency with R2
                                 gen_batch_output = self._merge_explore_outputs(
                                     gen_batch_output,
