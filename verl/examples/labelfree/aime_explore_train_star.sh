@@ -211,7 +211,7 @@ python -m verl.trainer.main_explore_ppo \
   actor_rollout_ref.rollout.temperature=$TEMP \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
   actor_rollout_ref.rollout.do_vote=True \
   actor_rollout_ref.rollout.n_vote=$N_VOTES_PER_PROMPT \
   actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
