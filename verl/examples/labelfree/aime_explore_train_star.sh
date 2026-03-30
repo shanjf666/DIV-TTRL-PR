@@ -1,6 +1,6 @@
 #!/bin/bash
 """
-bash examples/labelfree/aime_explore_train_star.sh --task AIME --backbone /XYFS01/HOME/sysu_jlou/sysu_jlou_jianfeng/model/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
+bash examples/labelfree/aime_explore_train_star.sh --task AIME --backbone /XYAIFS00/HOME/sysu_jlou/sysu_jlou_jianfeng/Qwen3-4B 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
 python /data/home/jianfeng/DIV-TTRL-PR/verl/scripts/model_merger.py \
     --backend fsdp \
     --local_dir /data/home/jianfeng/model/TTRL-AIME24/AIME-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/230602/global_step_45/actor \
@@ -177,7 +177,7 @@ else
 fi
 # EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/XYFS01/HOME/sysu_jlou/sysu_jlou_jianfeng/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/XYAIFS00/HOME/sysu_jlou/sysu_jlou_jianfeng/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 # === Run Training ===
 python -m verl.trainer.main_explore_ppo \
