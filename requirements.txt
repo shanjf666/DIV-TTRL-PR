@@ -35,11 +35,7 @@ tensordict==0.6.2
 # 数学解析、评估与公式处理
 # ==========================================
 sympy==1.13.1
-latex2sympy2==1.9.1
-latex2sympy2_extended==1.10.2
-word2number==1.1
 math-verify==0.8.0
-mathruler==0.1.0
 
 # ==========================================
 # 结构化输出与生成控制 (Guided Generation)
