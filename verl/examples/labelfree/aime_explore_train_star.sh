@@ -116,8 +116,8 @@ echo "=== AIME-TTT Exploration Training Configuration ==="
 echo "Task: $TASK"
 echo "Backbone model: $BACKBONE"
 
+DATE=$(date +%m%d)
 TIME_TAG=$(date +%H%M%S)
-
 # Set K value and sequence length
 K=4
 MAX_PROMPT_LENGTH=1024
@@ -211,7 +211,7 @@ python -m verl.trainer.main_explore_ppo \
   actor_rollout_ref.rollout.temperature=$TEMP \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.35 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.3 \
   actor_rollout_ref.rollout.do_vote=True \
   actor_rollout_ref.rollout.n_vote=$N_VOTES_PER_PROMPT \
   actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
@@ -230,7 +230,7 @@ python -m verl.trainer.main_explore_ppo \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=2 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
   trainer.save_freq=15 \
   trainer.test_freq=5 \
