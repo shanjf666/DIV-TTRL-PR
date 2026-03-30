@@ -92,9 +92,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 # === Set default values ===
-TASK="AIME"
+TASK="AIME-TTT"
 BACKBONE=${BACKBONE:-"Qwen3-4B-Base"}
-CLIP_HIGH=${CLIP_HIGH:-"true"}
+CLIP_HIGH=${CLIP_HIGH:-"false"}
 CLIP_SPECIFIED=${CLIP_SPECIFIED:-"false"}
 CLIP_VALUE=${CLIP_VALUE:-""}
 CLIP_MODE=${CLIP_MODE:-""}
@@ -125,11 +125,11 @@ MAX_TOKEN_LEN2=$((MAX_TOKEN_LEN * 2))
 
 # Training parameters
 EPISODE=40
-DATA_TRAIN_BATCH_SIZE=8
-N_VOTES_PER_PROMPT=64
+DATA_TRAIN_BATCH_SIZE=4
+N_VOTES_PER_PROMPT=32
 N_SAMPLES_PER_PROMPT=32
 MINI_BATCH_SIZE=1
-MICRO_BATCH_SIZE=2
+MICRO_BATCH_SIZE=1
 
 DATA_LOCAL_DIR="data"
 
@@ -138,7 +138,7 @@ if [[ "$BACKBONE" == *"/"* ]]; then
   BACKBONE_PATH="$BACKBONE"
   BACKBONE_NAME="${BACKBONE##*/}"
 else
-  BACKBONE_PATH="/root/autodl-tmp/model/${BACKBONE}"
+  BACKBONE_PATH="/data/home/lijiahui/DIV-TTRL/model/${BACKBONE}"
   BACKBONE_NAME="$BACKBONE"
 fi
 
@@ -175,7 +175,7 @@ else
 fi
 # EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/data/home/lijiahui/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 # === Run Training ===
 python -m verl.trainer.main_explore_ppo \
@@ -226,10 +226,10 @@ python -m verl.trainer.main_explore_ppo \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=8 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
-  trainer.save_freq=15 \
-  trainer.test_freq=2 \
+  trainer.save_freq=40 \
+  trainer.test_freq=4 \
   trainer.default_local_dir=$OUTPUT_DIR \
   trainer.total_epochs=$EPISODE "$@"
 
