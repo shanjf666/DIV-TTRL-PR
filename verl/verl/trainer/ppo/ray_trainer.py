@@ -1343,6 +1343,7 @@ class RayPPOTrainer:
                         if "ref_log_prob" in locals(): del ref_log_prob
                         if "values" in locals(): del values
                         if "reward_tensor" in locals(): del reward_tensor
+                        import gc
                         gc.collect()
                         torch.cuda.empty_cache()
 
