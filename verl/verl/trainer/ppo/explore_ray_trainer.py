@@ -498,10 +498,37 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                         batch.batch["attention_mask"], dim=-1
                     ).tolist()
 
-                    # ============================================================
-                    # TTRL: Reward + Down-sampling BEFORE expensive model passes
-                    # This halves the memory cost of compute_log_prob/ref/values
-                    # ============================================================
+                    # recompute old_log_probs
+                    with _timer("old_log_prob", timing_raw):
+                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+                        entropys = old_log_prob.batch["entropys"]
+                        response_masks = batch.batch["response_mask"]
+                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+                        entropy_loss = agg_loss(
+                            loss_mat=entropys,
+                            loss_mask=response_masks,
+                            loss_agg_mode=loss_agg_mode,
+                        )
+                        old_log_prob_metrics = {
+                            "actor/entropy_loss": entropy_loss.detach().item(),
+                            "train/entropy": entropy_loss.detach().item(),
+                        }
+                        old_log_prob_metrics["actor/entropy_mean_eval"] = (
+                            entropys.mean().detach().item()
+                        )
+                        metrics.update(old_log_prob_metrics)
+                        batch = batch.union(old_log_prob)
+
+                    if self.use_reference_policy:
+                        with _timer("ref", timing_raw):
+                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                            batch = batch.union(ref_log_prob)
+
+                    if self.use_critic:
+                        with _timer("values", timing_raw):
+                            values = self.critic_wg.compute_values(batch)
+                            batch = batch.union(values)
+
                     with _timer("adv", timing_raw):
                         # compute scores
                         if self.use_ttrl:
@@ -525,36 +552,26 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     if not k.startswith("_"):
                                         metrics.update({f"train/{k}": v})
 
-                                # Down Sampling — BEFORE compute_log_prob/ref/values
+                                # Down Sampling
                                 batch = self._select_top_k_per_prompt(
                                     batch, self.n_votes_per_prompt, self.n_samples_per_prompt
                                 )
                                 self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
-
-                                # Force physical copy to break view references to the
-                                # original 512-seq tensor block, freeing ~50% GPU memory
-                                batch.batch = batch.batch.contiguous()
-
-                                # Aggressively free old references
-                                del sorted_indices
-                                if "gen_batch_output" in locals():
-                                    del gen_batch_output
-                                gc.collect()
-                                torch.cuda.empty_cache()
-                                print(f"[Memory] Down-sampled {self.n_votes_per_prompt}→{self.n_samples_per_prompt} per prompt, batch size: {len(batch)}")
-
-                                # Recompute global_token_num for accurate throughput metrics
-                                batch.meta_info["global_token_num"] = torch.sum(
-                                    batch.batch["attention_mask"], dim=-1
-                                ).tolist()
 
                                 # Recompute ttrl metrics
                                 post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
                                 for k, v in post_reward_result.items():
                                     metrics.update({f"train/{k}": v})
 
-                                # Note: post_entropy is now computed after compute_log_prob
-                                # since entropy is only available on the down-sampled batch
+                                # Recompute Entropy
+                                post_entropy_loss = agg_loss(
+                                    loss_mat=batch.batch["entropys"],
+                                    loss_mask=batch.batch["response_mask"],
+                                    loss_agg_mode=loss_agg_mode,
+                                )
+                                metrics.update(
+                                    {"train/post_entropy": post_entropy_loss.detach().item()}
+                                )
 
                                 if "_answer_types" in ttrl_metrics:
                                     batch.non_tensor_batch["answer_types"] = ttrl_metrics[
@@ -593,42 +610,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             batch.non_tensor_batch.update(
                                 {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
                             )
-
-                    # ============================================================
-                    # Model forward passes — now on DOWN-SAMPLED batch (256 seq)
-                    # ============================================================
-                    # recompute old_log_probs
-                    with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        old_log_prob_metrics = {
-                            "actor/entropy_loss": entropy_loss.detach().item(),
-                            "train/entropy": entropy_loss.detach().item(),
-                        }
-                        old_log_prob_metrics["actor/entropy_mean_eval"] = (
-                            entropys.mean().detach().item()
-                        )
-                        metrics.update(old_log_prob_metrics)
-                        batch = batch.union(old_log_prob)
-
-                    if self.use_reference_policy:
-                        with _timer("ref", timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with _timer("adv_compute", timing_raw):
 
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:

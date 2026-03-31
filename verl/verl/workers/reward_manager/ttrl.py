@@ -27,7 +27,7 @@ from verl.utils.reward_score.ttrl.ttt_metrics import (
 class TTRLRewardManager:
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None, enable_hybrid=False, enable_minority_voting=False, minority_threshold=0.2, **kwargs) -> None:
+    def __init__(self, tokenizer, num_examine, reward_fn_key="data_source", compute_score=None, n_votes_per_prompt=1, n_samples_per_prompt=1, mode="eval", eval_n_samples=1, pseudo_label_file=None, enable_hybrid=False, **kwargs) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.reward_fn_key = reward_fn_key
@@ -37,8 +37,6 @@ class TTRLRewardManager:
         self.eval_n_samples = eval_n_samples
         self.pseudo_label_file = pseudo_label_file
         self.enable_hybrid = enable_hybrid
-        self.enable_minority_voting = enable_minority_voting
-        self.minority_threshold = minority_threshold
         
         self.offline_pseudo_labels = {}
         if pseudo_label_file:
@@ -356,29 +354,6 @@ class TTRLRewardManager:
                 if explore_label is not None:
                     verified_label = explore_label
                     off_policy = 1.0
-                # Minority Voting Logic: If online consistency is <= minority_threshold, pick the lowest frequency label
-                elif self.enable_minority_voting and online_consistency_rate <= self.minority_threshold:
-                    valid_indices = [idx for idx, ans in enumerate(model_answers) if ans is not None and ans != ""]
-                    if valid_indices:
-                        valid_counter = Counter([model_answers[idx] for idx in valid_indices])
-                        min_freq = min(valid_counter.values())
-                        min_freq_candidates = [ans for ans, freq in valid_counter.items() if freq == min_freq]
-                        
-                        best_candidate = None
-                        max_len = -1
-                        for ans in min_freq_candidates:
-                            ans_indices = [idx for idx in valid_indices if model_answers[idx] == ans]
-                            ans_max_len = max([len(group_pred_outputs[idx]) for idx in ans_indices])
-                            if ans_max_len > max_len:
-                                max_len = ans_max_len
-                                best_candidate = ans
-                        
-                        if best_candidate is not None:
-                            verified_label = best_candidate
-                            off_policy = 1.0
-                            print(f"[Minority Voting] Prompt {prompt_i}: SC={online_consistency_rate:.2f} <= threshold {self.minority_threshold}, picked minority answer '{best_candidate}' (freq {min_freq}) from candidates {min_freq_candidates}.")
-                    else:
-                        print(f"[Minority Voting] Prompt {prompt_i}: SC={online_consistency_rate:.2f} <= {self.minority_threshold}, but no valid extracted answers found. Falling through.")
                 # 4. Hybrid logic: If online consistency is low, fallback to offline label
                 elif self.enable_hybrid and online_consistency_rate < 0.3:
                     if offline_voted_answer:
