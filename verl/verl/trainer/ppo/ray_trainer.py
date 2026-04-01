@@ -1060,13 +1060,21 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        if self.use_ttrl:
-                            gen_batch.meta_info["sampling_kwargs"] = {"n": self.n_votes_per_prompt}
+                        # NOTE: Do NOT set sampling_kwargs["n"] here!
+                        # rollout.n (set at line ~1041) already tells the rollout framework
+                        # to repeat each prompt n times. Adding sampling_kwargs["n"] on top
+                        # would cause vLLM to generate n responses per ALREADY-DUPLICATED
+                        # prompt, resulting in n*n total responses and complete data misalignment.
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
-                            assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
-                        else:
-                            pass
+                            expected_size = len(batch) * self.n_votes_per_prompt
+                            actual_size = len(gen_batch_output)
+                            assert actual_size == expected_size, (
+                                f"[TTRL] gen_batch_output size mismatch: "
+                                f"expected {len(batch)} * {self.n_votes_per_prompt} = {expected_size}, "
+                                f"got {actual_size}. "
+                                f"If actual > expected, sampling_kwargs['n'] may be double-expanding."
+                            )
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
