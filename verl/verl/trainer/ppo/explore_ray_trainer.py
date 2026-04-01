@@ -24,6 +24,7 @@ import uuid
 from collections import defaultdict
 from copy import deepcopy
 from pprint import pprint
+from typing import Optional
 
 import numpy as np
 import torch
@@ -146,67 +147,24 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             }
 
     # ------------------------------------------------------------------ #
-    #  Helper: Smart truncation that avoids breaking LaTeX/code
-    # ------------------------------------------------------------------ #
-    def _smart_truncate(self, text: str, max_chars: int) -> str:
-        """
-        Truncate text intelligently, avoiding breaks in LaTeX formulas or code blocks.
-        Tries to find a safe truncation point (sentence end, paragraph, etc.).
-        """
-        if len(text) <= max_chars:
-            return text
-        
-        # Try to find a safe truncation point
-        truncated = text[:max_chars]
-        
-        # Look for safe break points (in order of preference)
-        safe_breaks = [
-            "\n\n",      # Paragraph break
-            ".\n",       # Sentence end with newline  
-            ". ",        # Sentence end
-            "}\n",       # End of LaTeX block
-            "$$\n",      # End of display math
-            "$\n",       # End of inline math
-            "\n",        # Line break
-        ]
-        
-        best_break = -1
-        for break_str in safe_breaks:
-            pos = truncated.rfind(break_str)
-            if pos > max_chars * 0.5:  # Only accept if we keep at least 50%
-                best_break = pos + len(break_str)
-                break
-        
-        if best_break > 0:
-            return truncated[:best_break].rstrip() + "\n... (truncated)"
-        else:
-            # Fallback: just truncate but add indicator
-            return truncated.rstrip() + "... (truncated)"
-
-    # ------------------------------------------------------------------ #
-    #  Helper: Build self-verify generation batch for low-consistency prompts
+    #  Helper: Build self-verify generation batch for prompts
     # ------------------------------------------------------------------ #
     def _build_explore_gen_batch(self, gen_batch, low_indices, consistency_results):
         """
-        Build a new generation batch for low-consistency prompts with
-        self-verify prompts injected.
+        Build a new generation batch for prompts with self-verify prompts injected.
         
-        CRITICAL: The generated verify prompts MUST NOT exceed the original R1
-        prompt length to prevent PPO gradient errors. If the verify prompt would
-        be longer, we truncate it here (before generation) rather than after,
-        ensuring generation and log_prob computation see the same prompt.
+        Now that R2 runs independently (separate backprop), we no longer need to
+        constrain R2 prompt length to match R1. The prompt can be any length up to
+        the model's max_position_embeddings.
 
         Args:
             gen_batch: Original generation batch (batch_size prompts).
-            low_indices: List of prompt indices that need round 2.
+            low_indices: List of prompt indices to process (can be all prompts).
             consistency_results: List of dicts with majority_answer / consistency_rate.
 
         Returns:
             DataProto: New batch ready for ``generate_sequences``.
         """
-        # Get the target prompt length from R1 (this is the maximum allowed)
-        r1_prompt_len = gen_batch.batch["input_ids"].shape[1]
-        
         new_input_ids_list = []
 
         for prompt_idx in low_indices:
@@ -235,11 +193,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 else:
                     problem_text = original_prompt[start_idx:].strip()
             
-            # Smart truncation of majority_answer to prevent OOM
-            # Use smart truncation that avoids breaking LaTeX/code
-            max_ans_chars = 1500  # Reduced to leave room for verify template
+            # Truncate majority_answer if extremely long to prevent OOM
+            max_ans_chars = 2000
             ans_str = str(majority_answer) if majority_answer is not None else "unknown"
-            ans_str = self._smart_truncate(ans_str, max_ans_chars)
+            if len(ans_str) > max_ans_chars:
+                ans_str = ans_str[:max_ans_chars] + "... (truncated)"
                 
             # Format the target template
             verify_text = self.explore_prompt_template.format(
@@ -262,14 +220,12 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     f"{chat_format['assistant_start']}"
                 )
             elif chat_format["format"] == "gemma":
-                # Gemma doesn't have system role, include it in user message
                 modified_prompt = (
                     f"<bos>"
                     f"{chat_format['user_start']}{self.explore_system_prompt}\n\n{verify_text}{chat_format['end']}"
                     f"{chat_format['assistant_start']}"
                 )
             else:
-                # Plain text fallback
                 modified_prompt = (
                     f"System: {self.explore_system_prompt}\n\n"
                     f"User: {verify_text}\n\n"
@@ -278,84 +234,17 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
-            
-            # CRITICAL: Ensure verify prompt doesn't exceed R1 prompt length
-            # This prevents the PPO gradient error where generation uses a different
-            # prompt than log_prob computation
-            if len(new_ids) > r1_prompt_len:
-                print(
-                    f"[Explore] WARNING: Verify prompt ({len(new_ids)} tokens) exceeds "
-                    f"R1 prompt length ({r1_prompt_len}). Truncating to prevent PPO gradient error."
-                )
-                # Truncate from the middle of the problem_text to preserve structure
-                # We need to reduce by (len(new_ids) - r1_prompt_len) tokens
-                excess_tokens = len(new_ids) - r1_prompt_len + 50  # +50 buffer
-                
-                # Estimate chars to remove (rough: 1 token ≈ 4 chars)
-                chars_to_remove = excess_tokens * 4
-                
-                # Truncate problem_text (the longest part)
-                if len(problem_text) > chars_to_remove + 100:
-                    problem_text = self._smart_truncate(
-                        problem_text, 
-                        len(problem_text) - chars_to_remove
-                    )
-                    
-                    # Rebuild and re-tokenize
-                    verify_text = self.explore_prompt_template.format(
-                        problem=problem_text,
-                        majority_answer=ans_str
-                    )
-                    
-                    if chat_format["format"] == "chatml":
-                        modified_prompt = (
-                            f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
-                            f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
-                            f"{chat_format['assistant_start']}"
-                        )
-                    elif chat_format["format"] == "llama3":
-                        modified_prompt = (
-                            f"<|begin_of_text|>"
-                            f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
-                            f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
-                            f"{chat_format['assistant_start']}"
-                        )
-                    elif chat_format["format"] == "gemma":
-                        modified_prompt = (
-                            f"<bos>"
-                            f"{chat_format['user_start']}{self.explore_system_prompt}\n\n{verify_text}{chat_format['end']}"
-                            f"{chat_format['assistant_start']}"
-                        )
-                    else:
-                        modified_prompt = (
-                            f"System: {self.explore_system_prompt}\n\n"
-                            f"User: {verify_text}\n\n"
-                            f"Assistant: "
-                        )
-                    
-                    new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
-                
-                # Final safety: hard truncate if still too long
-                if len(new_ids) > r1_prompt_len:
-                    new_ids = new_ids[-r1_prompt_len:]  # Keep the end (assistant marker)
-            
             new_input_ids_list.append(torch.tensor(new_ids, dtype=torch.long))
 
             # Print first modified prompt for debugging
             if prompt_idx == low_indices[0]:
                 print(f"[Explore] Modified prompt (first sample, idx={prompt_idx}):")
-                print(f"  Original length: {valid_length}, New length: {len(new_ids)}, Max allowed: {r1_prompt_len}")
+                print(f"  Original length: {valid_length}, New length: {len(new_ids)}")
                 print(f"  Chat format: {chat_format['format']}")
-                # Print the last 200 chars to verify injection
                 print(f"  ...{modified_prompt[-200:]}")
 
-        # Pad to same length (left-pad with pad_token_id)
-        # Use R1 prompt length as target to ensure consistency
-        target_len = r1_prompt_len
+        # Pad to same length within this batch (left-pad with pad_token_id)
         max_len = max(len(ids) for ids in new_input_ids_list)
-        # Ensure we pad to at least target_len for proper merge later
-        max_len = max(max_len, target_len)
-        
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
         padded_input_ids = []
@@ -372,7 +261,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 torch.zeros(pad_len, dtype=torch.long),
                 torch.ones(len(ids), dtype=torch.long),
             ])
-            # position_ids MUST start at 0 for the first valid token
             pos_ids = torch.cat([
                 torch.zeros(pad_len, dtype=torch.long),
                 torch.arange(len(ids), dtype=torch.long),
@@ -398,8 +286,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 np.array(low_indices)
             ]
         
-        # CRITICAL: Carry over extra_info for the selected indices
-        # This ensures explore_output has correct index information after generation
+        # Carry over extra_info for the selected indices
         if "extra_info" in gen_batch.non_tensor_batch:
             non_tensors["extra_info"] = gen_batch.non_tensor_batch["extra_info"][
                 np.array(low_indices)
@@ -410,77 +297,391 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
         return explore_batch
 
-    # ------------------------------------------------------------------ #
-    #  Helper: Merge high-consistency R1 outputs + low-consistency R2 outputs
-    # ------------------------------------------------------------------ #
-    def _merge_explore_outputs(
+    def _release_memory_cache(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _slice_prompt_groups(self, grouped_output: DataProto, prompt_indices, group_size: int):
+        if not prompt_indices:
+            return None
+        grouped = []
+        for idx in prompt_indices:
+            start = idx * group_size
+            end = start + group_size
+            grouped.append(grouped_output[start:end])
+        return DataProto.concat(grouped)
+
+    def _build_uid_majority_map(self, batch: DataProto, consistency_results, prompt_indices):
+        if "uid" not in batch.non_tensor_batch:
+            return {}
+
+        uid_arr = batch.non_tensor_batch["uid"]
+        uid_to_majority = {}
+        for idx in prompt_indices:
+            if idx >= len(consistency_results):
+                continue
+            uid_to_majority[uid_arr[idx]] = consistency_results[idx].get("majority_answer")
+        return uid_to_majority
+
+    def _inject_pseudo_labels_by_uid(self, batch: DataProto, uid_to_label: dict, target_indices=None):
+        if not uid_to_label:
+            return 0
+        if "uid" not in batch.non_tensor_batch or "reward_model" not in batch.non_tensor_batch:
+            return 0
+
+        uid_arr = batch.non_tensor_batch["uid"]
+        reward_models = batch.non_tensor_batch["reward_model"]
+        if target_indices is None:
+            target_indices = range(len(batch))
+
+        overwritten = 0
+        for idx in target_indices:
+            uid = uid_arr[idx]
+            if uid not in uid_to_label:
+                continue
+
+            reward_model_item = reward_models[idx]
+            if isinstance(reward_model_item, dict):
+                reward_model_item["ground_truth"] = uid_to_label[uid]
+                reward_models[idx] = reward_model_item
+                overwritten += 1
+
+        batch.non_tensor_batch["reward_model"] = reward_models
+        return overwritten
+
+    def _update_metrics_with_prefix(self, metrics: dict, step_metrics: dict, prefix: Optional[str]):
+        if not prefix:
+            metrics.update(step_metrics)
+            return
+        metrics.update({f"{prefix}/{k}": v for k, v in step_metrics.items()})
+
+    def _ppo_update_step(
         self,
-        gen_batch_output,
-        explore_output,
-        high_indices,
-        low_indices,
-        n_votes_per_prompt,
+        batch: DataProto,
+        gen_batch_output: DataProto,
+        metrics: dict,
+        timing_raw: dict,
+        prefix: Optional[str] = None,
+        rollout_n: Optional[int] = None,
     ):
-        """
-        Reconstruct the full gen_batch_output by:
-          - Keeping round-1 responses for high-consistency prompts
-          - Replacing with round-2 responses for low-consistency prompts
+        if rollout_n is not None:
+            self.config.actor_rollout_ref.rollout.n = rollout_n
 
-        Args:
-            gen_batch_output: Original round-1 output (all prompts * n_votes).
-            explore_output: Round-2 output (low-consistency prompts * n_votes).
-            high_indices: Prompt indices that keep round-1 responses.
-            low_indices: Prompt indices that use round-2 responses.
-            n_votes_per_prompt: Number of responses per prompt.
+        if "uid" not in batch.non_tensor_batch:
+            batch.non_tensor_batch["uid"] = np.array(
+                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+            )
 
-        Returns:
-            DataProto: Merged output with same structure as gen_batch_output.
-        """
-        # Build a mapping: low_idx -> position in explore_output
-        low_idx_to_explore = {idx: i for i, idx in enumerate(low_indices)}
+        # repeat to align with repeated responses in rollout
+        batch = batch.repeat(
+            repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+        )
+        batch = batch.union(gen_batch_output)
+        batch.batch["response_mask"] = compute_response_mask(batch)
 
-        # Collect output DataProtos in original prompt order
-        all_protos = []
-        total_prompts = len(high_indices) + len(low_indices)
+        step_metrics = {}
+        if self.config.trainer.balance_batch:
+            self._balance_batch(batch, metrics=step_metrics)
 
-        for prompt_idx in range(total_prompts):
-            start = prompt_idx * n_votes_per_prompt
-            end = start + n_votes_per_prompt
+        # compute global_valid tokens
+        batch.meta_info["global_token_num"] = torch.sum(
+            batch.batch["attention_mask"], dim=-1
+        ).tolist()
 
-            if prompt_idx in low_idx_to_explore:
-                # Use round-2 output
-                explore_pos = low_idx_to_explore[prompt_idx]
-                e_start = explore_pos * n_votes_per_prompt
-                e_end = e_start + n_votes_per_prompt
-                all_protos.append(explore_output[e_start:e_end])
+        # recompute old_log_probs
+        with _timer("old_log_prob", timing_raw):
+            old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
+            entropys = old_log_prob.batch["entropys"]
+            response_masks = batch.batch["response_mask"]
+            loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
+            entropy_loss = agg_loss(
+                loss_mat=entropys,
+                loss_mask=response_masks,
+                loss_agg_mode=loss_agg_mode,
+            )
+            old_log_prob_metrics = {
+                "actor/entropy_loss": entropy_loss.detach().item(),
+                "train/entropy": entropy_loss.detach().item(),
+            }
+            old_log_prob_metrics["actor/entropy_mean_eval"] = (
+                entropys.mean().detach().item()
+            )
+            step_metrics.update(old_log_prob_metrics)
+            batch = batch.union(old_log_prob)
+
+        if self.use_reference_policy:
+            with _timer("ref", timing_raw):
+                ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
+                batch = batch.union(ref_log_prob)
+
+        if self.use_critic:
+            with _timer("values", timing_raw):
+                values = self.critic_wg.compute_values(batch)
+                batch = batch.union(values)
+
+        with _timer("adv", timing_raw):
+            if self.use_ttrl and "extra_info" in batch.non_tensor_batch:
+                sorted_indices = sorted(
+                    range(len(batch)),
+                    key=lambda i, batch=batch: batch[i].non_tensor_batch["extra_info"]["index"],
+                )
+                batch = batch[sorted_indices]
+
+            if self.use_rm:
+                reward_tensor = self.rm_wg.compute_rm_score(batch)
+                batch = batch.union(reward_tensor)
+
+            reward_extra_infos_dict: dict[str, list]
+            try:
+                reward_result = self.reward_fn(batch, return_dict=True)
+                reward_tensor = reward_result["reward_tensor"]
+                reward_extra_infos_dict = reward_result["reward_extra_info"]
+                if self.use_ttrl:
+                    ttrl_metrics = reward_result["ttrl_info"]
+                    for k, v in ttrl_metrics.items():
+                        if not k.startswith("_"):
+                            step_metrics.update({f"train/{k}": v})
+
+                    # Down Sampling
+                    batch = self._select_top_k_per_prompt(
+                        batch, self.n_votes_per_prompt, self.n_samples_per_prompt
+                    )
+                    self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
+
+                    # Recompute ttrl metrics
+                    post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
+                    for k, v in post_reward_result.items():
+                        step_metrics.update({f"train/{k}": v})
+
+                    # Recompute Entropy
+                    post_entropy_loss = agg_loss(
+                        loss_mat=batch.batch["entropys"],
+                        loss_mask=batch.batch["response_mask"],
+                        loss_agg_mode=loss_agg_mode,
+                    )
+                    step_metrics.update(
+                        {"train/post_entropy": post_entropy_loss.detach().item()}
+                    )
+
+                    if "_answer_types" in ttrl_metrics:
+                        batch.non_tensor_batch["answer_types"] = ttrl_metrics[
+                            "_answer_types"
+                        ]
+                    if "_oracle_answer_types" in ttrl_metrics:
+                        batch.non_tensor_batch["oracle_answer_types"] = ttrl_metrics[
+                            "_oracle_answer_types"
+                        ]
+                    if "_consistency_rate" in ttrl_metrics:
+                        batch.non_tensor_batch["consistency_rate"] = ttrl_metrics[
+                            "_consistency_rate"
+                        ]
+                    if "_accuracy_rate" in ttrl_metrics:
+                        batch.non_tensor_batch["accuracy_rate"] = ttrl_metrics[
+                            "_accuracy_rate"
+                        ]
+                    if "_label_accuracy" in ttrl_metrics:
+                        batch.non_tensor_batch["label_accuracy"] = ttrl_metrics[
+                            "_label_accuracy"
+                        ]
+                    if "_zero_advantage_mask" in ttrl_metrics:
+                        batch.non_tensor_batch["zero_advantage_mask"] = ttrl_metrics[
+                            "_zero_advantage_mask"
+                        ]
+
+            except Exception as e:
+                print(f"Error in reward_fn: {e}")
+                reward_tensor = self.reward_fn(batch)
+                reward_extra_infos_dict = {}
+
+            batch.batch["token_level_scores"] = reward_tensor
+
+            if reward_extra_infos_dict:
+                batch.non_tensor_batch.update(
+                    {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                )
+
+            # compute rewards. apply_kl_penalty if available
+            if self.config.algorithm.use_kl_in_reward:
+                kl_penalty = self.config.algorithm.kl_penalty
+                if prefix == "r2":
+                    kl_penalty = self.explore_kl_penalty
+
+                batch, kl_metrics = apply_kl_penalty(
+                    batch,
+                    kl_penalty=kl_penalty,
+                )
+                step_metrics["train/active_kl_penalty"] = float(kl_penalty)
+                step_metrics.update(kl_metrics)
             else:
-                # Use round-1 output
-                all_protos.append(gen_batch_output[start:end])
+                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-        # Find the maximum dimensions for all 2D tensors to pad them safely
-        # keys usually are: 'responses', 'prompts', etc.
-        tensor_keys = list(all_protos[0].batch.keys())
-        max_shapes = {key: 0 for key in tensor_keys if all_protos[0].batch[key].dim() == 2}
 
-        # Calculate max sequence length for each 2D tensor
-        for proto in all_protos:
-            for key in max_shapes:
-                if proto.batch[key].shape[1] > max_shapes[key]:
-                    max_shapes[key] = proto.batch[key].shape[1]
+            # compute advantages
+            diversity_density_config = None
+            if self.config.algorithm.adv_estimator in [
+                AdvantageEstimator.PASS_GRPO,
+                AdvantageEstimator.PASS_GRPO_PENALIZED,
+            ]:
+                diversity_density_config = {
+                    "k": getattr(self.config.algorithm, "diversity_density_k", 4),
+                    "fallback_estimator": getattr(
+                        self.config.algorithm, "diversity_density_fallback", "grpo"
+                    ),
+                    "use_metric": getattr(
+                        self.config.algorithm,
+                        "diversity_density_use_metric",
+                        "consistency_rate",
+                    ),
+                    "consistency_threshold": getattr(
+                        self.config.algorithm, "consistency_threshold", 0.0
+                    ),
+                    "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
+                    "c_max": getattr(self.config.algorithm, "c_max", 2.0),
+                    "tau_rep": getattr(self.config.algorithm, "tau_rep", 0.2),
+                    "gamma": getattr(self.config.algorithm, "gamma", 1.0),
+                    "p_max": getattr(self.config.algorithm, "p_max", 0.15),
+                    "n_gram_size": getattr(self.config.algorithm, "n_gram_size", 3),
+                    "use_rep_penalty": getattr(
+                        self.config.algorithm, "use_rep_penalty", False
+                    ),
+                    "div_sc_threshold": getattr(
+                        self.config.algorithm, "div_sc_threshold", 0.5
+                    ),
+                }
 
-        # Pad all 2D tensors to match the max dimensions
-        for proto in all_protos:
-            for key in max_shapes:
-                tensor = proto.batch[key]
-                pad_len = max_shapes[key] - tensor.shape[1]
-                if pad_len > 0:
-                    # Pad on the right side with 0
-                    import torch.nn.functional as F
-                    padded_tensor = F.pad(tensor, (0, pad_len), value=self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None else 0)
-                    proto.batch[key] = padded_tensor
+            batch = compute_advantage(
+                batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                diversity_density_config=diversity_density_config,
+            )
 
-        merged = DataProto.concat(all_protos)
-        return merged
+            # Apply zero_advantage_mask if present
+            if "zero_advantage_mask" in batch.non_tensor_batch:
+                zero_mask = torch.tensor(
+                    batch.non_tensor_batch["zero_advantage_mask"],
+                    dtype=torch.float32,
+                    device=batch.batch["advantages"].device,
+                ).unsqueeze(-1)
+                batch.batch["advantages"] = batch.batch["advantages"] * (1.0 - zero_mask)
+                step_metrics["train/test_minority_zeroed_ratio"] = float(
+                    zero_mask.mean().item()
+                )
+
+            # Log diversity density usage statistics if available
+            if "diversity_density_ratio" in batch.meta_info:
+                step_metrics["train/diversity_density_ratio"] = float(
+                    batch.meta_info["diversity_density_ratio"]
+                )
+            if "fallback_ratio" in batch.meta_info:
+                step_metrics["train/fallback_ratio"] = float(
+                    batch.meta_info["fallback_ratio"]
+                )
+
+            # === Advantage Bias Diagnostics ===
+            if (
+                "oracle_answer_types" in batch.non_tensor_batch
+                and self.config.algorithm.adv_estimator == AdvantageEstimator.PASS_GRPO
+                and diversity_density_config is not None
+            ):
+                try:
+                    oracle_adv, _ = core_algos.compute_pass_grpo_advantage(
+                        token_level_rewards=batch.batch["token_level_rewards"],
+                        response_mask=batch.batch["response_mask"],
+                        index=batch.non_tensor_batch["uid"],
+                        answer_types=batch.non_tensor_batch["oracle_answer_types"],
+                        k=diversity_density_config["k"],
+                    )
+                    tta_adv = batch.batch["advantages"]
+
+                    tta_scalar = tta_adv.sum(-1)
+                    oracle_scalar = oracle_adv.sum(-1)
+                    valid = batch.batch["response_mask"].sum(-1) > 0
+
+                    if valid.any():
+                        sign_match = ((tta_scalar > 0) == (oracle_scalar > 0)).float()
+                        step_metrics["diag/adv_sign_match_rate"] = (
+                            sign_match[valid].mean().item()
+                        )
+                        step_metrics["diag/adv_mse"] = (
+                            ((tta_scalar - oracle_scalar) ** 2)[valid].mean().item()
+                        )
+                        step_metrics["diag/adv_mean_bias"] = (
+                            (tta_scalar - oracle_scalar)[valid].mean().item()
+                        )
+                except Exception as e:
+                    print(f"Warning: Advantage bias diagnostics failed: {e}")
+
+            # Log pass_grpo diagnostic metrics if available
+            if "pass_grpo/correct_ratio" in batch.meta_info:
+                step_metrics["train/pass_grpo_correct_ratio"] = float(
+                    batch.meta_info["pass_grpo/correct_ratio"]
+                )
+            if "pass_grpo/avg_correct_advantage" in batch.meta_info:
+                step_metrics["train/pass_grpo_avg_correct_adv"] = float(
+                    batch.meta_info["pass_grpo/avg_correct_advantage"]
+                )
+            if "pass_grpo/avg_incorrect_advantage" in batch.meta_info:
+                step_metrics["train/pass_grpo_avg_incorrect_adv"] = float(
+                    batch.meta_info["pass_grpo/avg_incorrect_advantage"]
+                )
+            if "pass_grpo/avg_total_advantage" in batch.meta_info:
+                step_metrics["train/pass_grpo_avg_total_adv"] = float(
+                    batch.meta_info["pass_grpo/avg_total_advantage"]
+                )
+
+            # Log diversity density advantage metrics
+            if "diversity/avg_advantage" in batch.meta_info:
+                step_metrics["train/diversity_avg_adv"] = float(
+                    batch.meta_info["diversity/avg_advantage"]
+                )
+
+            # Log bootstrap_passk metrics if available
+            for bp_key in [
+                "bootstrap_passk/num_low_prompts",
+                "bootstrap_passk/num_high_prompts",
+                "bootstrap_passk/low_ratio",
+                "bootstrap_passk/avg_low_advantage",
+                "bootstrap_passk/avg_high_advantage",
+                "bootstrap_passk/avg_total_advantage",
+            ]:
+                if bp_key in batch.meta_info:
+                    step_metrics[f"train/{bp_key.replace('/', '_')}"] = float(
+                        batch.meta_info[bp_key]
+                    )
+
+            # Log pass_grpo_penalized metrics if available
+            for pp_key in [
+                "pass_grpo_penalized/avg_r_div",
+                "pass_grpo_penalized/r_div_triggered_ratio",
+                "pass_grpo_penalized/avg_raw_a_passk",
+                "pass_grpo_penalized/avg_adv_raw",
+                "pass_grpo_penalized/avg_total_advantage",
+            ]:
+                if pp_key in batch.meta_info:
+                    step_metrics[f"train/{pp_key.replace('/', '_')}"] = float(
+                        batch.meta_info[pp_key]
+                    )
+
+        # update critic
+        if self.use_critic:
+            with _timer("update_critic", timing_raw):
+                critic_output = self.critic_wg.update_critic(batch)
+            critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+            step_metrics.update(critic_output_metrics)
+
+        # implement critic warmup
+        if self.config.trainer.critic_warmup <= self.global_steps:
+            with _timer("update_actor", timing_raw):
+                actor_output = self.actor_rollout_wg.update_actor(batch)
+            actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+            step_metrics.update(actor_output_metrics)
+
+        self._update_metrics_with_prefix(metrics, step_metrics, prefix)
+        return batch
 
     # ------------------------------------------------------------------ #
     #  Main training loop (overrides RayPPOTrainer.fit)
@@ -531,10 +732,24 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # Assign stable UIDs before any split/sort so we can map R2 pseudo-labels
+                # back to the exact R1 samples.
+                batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                )
+
                 batch.meta_info["do_vote"] = False
                 if self.use_ttrl:
                     self.config.actor_rollout_ref.rollout.n = self.n_votes_per_prompt
                     batch.meta_info["do_vote"] = True
+
+                    # Keep a deterministic prompt order for grouping-based consistency stats.
+                    if "extra_info" in batch.non_tensor_batch:
+                        sorted_indices = sorted(
+                            range(len(batch)),
+                            key=lambda i, batch=batch: batch[i].non_tensor_batch["extra_info"]["index"],
+                        )
+                        batch = batch[sorted_indices]
 
                 # pop those keys for generation
                 if "multi_modal_inputs" in batch.non_tensor_batch.keys():
@@ -554,155 +769,18 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 # gen_batch needs it for _build_explore_gen_batch, batch needs it for sorting
                 if "extra_info" in batch.non_tensor_batch:
                     gen_batch.non_tensor_batch["extra_info"] = batch.non_tensor_batch["extra_info"]
+                gen_batch.non_tensor_batch["uid"] = batch.non_tensor_batch["uid"]
 
                 is_last_step = self.global_steps >= self.total_training_steps
+                train_batch_for_metrics = None
 
                 with _timer("step", timing_raw):
-                    # ============================================================
-                    # Round 1: Generate initial rollouts
-                    # ============================================================
                     with _timer("gen", timing_raw):
-                        gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        gen_batch_output_r1 = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
-                            assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
+                            assert len(gen_batch_output_r1) == len(batch) * self.n_votes_per_prompt
 
-                    # ============================================================
-                    # Two-Stage Exploration (if enabled)
-                    # ============================================================
-                    if self.use_explore_rollout and self.use_ttrl:
-                        with _timer("explore", timing_raw):
-                            # --- Consistency Evaluation ---
-                            # Build a temporary merged batch for consistency computation
-                            tmp_batch = batch.repeat(
-                                repeat_times=self.n_votes_per_prompt, interleave=True
-                            )
-                            tmp_batch = tmp_batch.union(gen_batch_output)
-
-                            # Sort by index for correct per-prompt grouping
-                            # This sorted order will be used for ALL subsequent operations
-                            sorted_indices = sorted(
-                                range(len(tmp_batch)),
-                                key=lambda i: tmp_batch[i].non_tensor_batch["extra_info"]["index"],
-                            )
-                            tmp_batch = tmp_batch[sorted_indices]
-                            
-                            # CRITICAL: Use the SAME sorted_indices to reorder gen_batch_output
-                            # gen_batch_output itself doesn't have extra_info, but tmp_batch.union()
-                            # gave it the same ordering as batch.repeat(). So sorted_indices applies.
-                            gen_batch_output = gen_batch_output[sorted_indices]
-                            
-                            # Also sort gen_batch and batch to align indices for _build_explore_gen_batch
-                            # gen_batch has extra_info (it's a subset of batch)
-                            gen_batch_sorted_indices = sorted(
-                                range(len(gen_batch)),
-                                key=lambda i: gen_batch[i].non_tensor_batch["extra_info"]["index"],
-                            )
-                            gen_batch = gen_batch[gen_batch_sorted_indices]
-                            
-                            # Also sort `batch` to match for later batch.repeat().union()
-                            batch_sorted_indices = sorted(
-                                range(len(batch)),
-                                key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
-                            )
-                            batch = batch[batch_sorted_indices]
-
-                            # Compute consistency per prompt
-                            consistency_results = self.reward_fn.compute_majority_and_consistency(
-                                tmp_batch
-                            )
-
-                            # --- Split into high / low consistency ---
-                            # Now indices refer to sorted order (gen_batch, gen_batch_output, batch are ALL sorted)
-                            high_indices = []
-                            low_indices = []
-                            prompt_num = len(consistency_results)
-                            for i, result in enumerate(consistency_results):
-                                if result["consistency_rate"] > self.explore_threshold:
-                                    high_indices.append(i)
-                                else:
-                                    low_indices.append(i)
-
-                            round2_count = len(low_indices)
-                            round2_ratio = round2_count / prompt_num if prompt_num > 0 else 0.0
-
-                            # Log explore metrics
-                            metrics["explore/round2_sample_quantity"] = round2_count
-                            metrics["explore/round2_sample_ratio"] = round2_ratio
-
-                            print(
-                                f"[Explore] Round 2 triggered for {round2_count}/{prompt_num} "
-                                f"prompts ({round2_ratio:.2%}), threshold={self.explore_threshold}"
-                            )
-
-                            # --- Round 2 Rollout (if needed) ---
-                            if low_indices:
-                                # Clean up temporary batch before generating Round 2 to save memory
-                                del tmp_batch
-                                gc.collect()
-                                torch.cuda.empty_cache()
-
-                                # Build self-verify prompts for low-consistency samples
-                                explore_gen_batch = self._build_explore_gen_batch(
-                                    gen_batch, low_indices, consistency_results
-                                )
-
-                                # Pad for DP
-                                explore_gen_batch_padded, explore_pad_size = (
-                                    pad_dataproto_to_divisor(
-                                        explore_gen_batch, self.actor_rollout_wg.world_size
-                                    )
-                                )
-
-                                # Generate round-2 responses
-                                explore_output_padded = (
-                                    self.actor_rollout_wg.generate_sequences(explore_gen_batch_padded)
-                                )
-
-                                # Unpad (must unpad padding prompts, taking N_votes into account!)
-                                explore_output = unpad_dataproto(
-                                    explore_output_padded, pad_size=explore_pad_size * self.n_votes_per_prompt
-                                )
-
-                                # --- Compute accuracy gap between R1 and R2 for low-consistency samples ---
-                                try:
-                                    r1_protos = []
-                                    for idx in low_indices:
-                                        r1_protos.append(gen_batch_output[idx * self.n_votes_per_prompt : (idx + 1) * self.n_votes_per_prompt])
-                                    r1_outputs = DataProto.concat(r1_protos)
-                                    r1_low_batch = batch[low_indices].repeat(repeat_times=self.n_votes_per_prompt, interleave=True).union(r1_outputs)
-                                    if hasattr(self.reward_fn, 'compute_accuracy'):
-                                        r1_acc = self.reward_fn.compute_accuracy(r1_low_batch)
-                                        r2_low_batch = batch[low_indices].repeat(repeat_times=self.n_votes_per_prompt, interleave=True).union(explore_output)
-                                        r2_acc = self.reward_fn.compute_accuracy(r2_low_batch)
-
-                                        metrics["explore/r1_low_consistency_acc"] = r1_acc
-                                        metrics["explore/r2_low_consistency_acc"] = r2_acc
-                                        metrics["explore/r2_r1_acc_gap"] = r2_acc - r1_acc
-                                        print(f"[Explore] Accuracy for low-consistency prompts: R1={r1_acc:.2%}, R2={r2_acc:.2%}, Gap={(r2_acc - r1_acc):.2%}")
-                                except Exception as e:
-                                    print(f"[Explore] WARNING: Failed to compute accuracy gap: {e}")
-
-                                # Merge: keep high-consistency R1, replace low-consistency with R2
-                                gen_batch_output = self._merge_explore_outputs(
-                                    gen_batch_output,
-                                    explore_output,
-                                    high_indices,
-                                    low_indices,
-                                    self.n_votes_per_prompt,
-                                )
-
-                                del explore_gen_batch, explore_gen_batch_padded
-                                del explore_output_padded, explore_output
-                                gc.collect()
-                                torch.cuda.empty_cache()
-                            else:
-                                del tmp_batch
-                                gc.collect()
-                                torch.cuda.empty_cache()
-
-                    # ============================================================
-                    # REMAX baseline (unchanged from original)
-                    # ============================================================
+                    # REMAX baseline is computed on the base batch once per step.
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -720,325 +798,164 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # ============================================================
-                    # Standard PPO pipeline (unchanged from original)
-                    # ============================================================
-                    batch.non_tensor_batch["uid"] = np.array(
-                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                    )
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(
-                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
-                    )
-                    batch = batch.union(gen_batch_output)
-
-                    batch.batch["response_mask"] = compute_response_mask(batch)
-                    if self.config.trainer.balance_batch:
-                        self._balance_batch(batch, metrics=metrics)
-
-                    # compute global_valid tokens
-                    batch.meta_info["global_token_num"] = torch.sum(
-                        batch.batch["attention_mask"], dim=-1
-                    ).tolist()
-
-                    # recompute old_log_probs
-                    with _timer("old_log_prob", timing_raw):
-                        old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
-                        entropys = old_log_prob.batch["entropys"]
-                        response_masks = batch.batch["response_mask"]
-                        loss_agg_mode = self.config.actor_rollout_ref.actor.loss_agg_mode
-                        entropy_loss = agg_loss(
-                            loss_mat=entropys,
-                            loss_mask=response_masks,
-                            loss_agg_mode=loss_agg_mode,
-                        )
-                        old_log_prob_metrics = {
-                            "actor/entropy_loss": entropy_loss.detach().item(),
-                            "train/entropy": entropy_loss.detach().item(),
-                        }
-                        old_log_prob_metrics["actor/entropy_mean_eval"] = (
-                            entropys.mean().detach().item()
-                        )
-                        metrics.update(old_log_prob_metrics)
-                        batch = batch.union(old_log_prob)
-
-                    if self.use_reference_policy:
-                        with _timer("ref", timing_raw):
-                            ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
-                            batch = batch.union(ref_log_prob)
-
-                    if self.use_critic:
-                        with _timer("values", timing_raw):
-                            values = self.critic_wg.compute_values(batch)
-                            batch = batch.union(values)
-
-                    with _timer("adv", timing_raw):
-                        # compute scores
-                        if self.use_ttrl:
-                            # Re-sort batch by index to ensure correct per-prompt grouping
-                            # This is critical after explore merge which may change order
-                            sorted_indices = sorted(
-                                range(len(batch)),
-                                key=lambda i: batch[i].non_tensor_batch["extra_info"]["index"],
+                    if self.use_explore_rollout and self.use_ttrl:
+                        with _timer("explore", timing_raw):
+                            # Stage 1: evaluate R1 consistency.
+                            tmp_batch_r1 = batch.repeat(
+                                repeat_times=self.n_votes_per_prompt, interleave=True
                             )
-                            batch = batch[sorted_indices]
-                        if self.use_rm:
-                            reward_tensor = self.rm_wg.compute_rm_score(batch)
-                            batch = batch.union(reward_tensor)
+                            tmp_batch_r1 = tmp_batch_r1.union(gen_batch_output_r1)
 
-                        reward_extra_infos_dict: dict[str, list]
-                        try:
-                            reward_result = self.reward_fn(batch, return_dict=True)
-                            reward_tensor = reward_result["reward_tensor"]
-                            reward_extra_infos_dict = reward_result["reward_extra_info"]
-                            if self.use_ttrl:
-                                ttrl_metrics = reward_result["ttrl_info"]
-                                for k, v in ttrl_metrics.items():
-                                    if not k.startswith("_"):
-                                        metrics.update({f"train/{k}": v})
+                            consistency_results_r1 = self.reward_fn.compute_majority_and_consistency(
+                                tmp_batch_r1
+                            )
+                            prompt_num = len(consistency_results_r1)
+                            low_indices = [
+                                i
+                                for i, result in enumerate(consistency_results_r1)
+                                if result["consistency_rate"] <= self.explore_threshold
+                            ]
 
-                                # Down Sampling
-                                batch = self._select_top_k_per_prompt(
-                                    batch, self.n_votes_per_prompt, self.n_samples_per_prompt
-                                )
-                                self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
-
-                                # Recompute ttrl metrics
-                                post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
-                                for k, v in post_reward_result.items():
-                                    metrics.update({f"train/{k}": v})
-
-                                # Recompute Entropy
-                                post_entropy_loss = agg_loss(
-                                    loss_mat=batch.batch["entropys"],
-                                    loss_mask=batch.batch["response_mask"],
-                                    loss_agg_mode=loss_agg_mode,
-                                )
-                                metrics.update(
-                                    {"train/post_entropy": post_entropy_loss.detach().item()}
-                                )
-
-                                if "_answer_types" in ttrl_metrics:
-                                    batch.non_tensor_batch["answer_types"] = ttrl_metrics[
-                                        "_answer_types"
-                                    ]
-                                if "_oracle_answer_types" in ttrl_metrics:
-                                    batch.non_tensor_batch["oracle_answer_types"] = ttrl_metrics[
-                                        "_oracle_answer_types"
-                                    ]
-                                if "_consistency_rate" in ttrl_metrics:
-                                    batch.non_tensor_batch["consistency_rate"] = ttrl_metrics[
-                                        "_consistency_rate"
-                                    ]
-                                if "_accuracy_rate" in ttrl_metrics:
-                                    batch.non_tensor_batch["accuracy_rate"] = ttrl_metrics[
-                                        "_accuracy_rate"
-                                    ]
-                                if "_label_accuracy" in ttrl_metrics:
-                                    batch.non_tensor_batch["label_accuracy"] = ttrl_metrics[
-                                        "_label_accuracy"
-                                    ]
-                                if "_zero_advantage_mask" in ttrl_metrics:
-                                    batch.non_tensor_batch["zero_advantage_mask"] = ttrl_metrics[
-                                        "_zero_advantage_mask"
-                                    ]
-
-                        except Exception as e:
-                            print(f"Error in reward_fn: {e}")
-                            reward_tensor = self.reward_fn(batch)
-                            reward_extra_infos_dict = {}
-
-                        batch.batch["token_level_scores"] = reward_tensor
-
-                        print(f"{list(reward_extra_infos_dict.keys())=}")
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update(
-                                {k: np.array(v) for k, v in reward_extra_infos_dict.items()}
+                            metrics["explore/round2_sample_quantity"] = len(low_indices)
+                            metrics["explore/round2_sample_ratio"] = (
+                                len(low_indices) / prompt_num if prompt_num > 0 else 0.0
                             )
 
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(
-                                batch,
-                                kl_ctrl=self.kl_ctrl_in_reward,
-                                kl_penalty=self.config.algorithm.kl_penalty,
-                            )
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
-
-                        # compute advantages
-                        diversity_density_config = None
-                        if self.config.algorithm.adv_estimator in [
-                            AdvantageEstimator.PASS_GRPO,
-                            AdvantageEstimator.PASS_GRPO_PENALIZED,
-                        ]:
-                            diversity_density_config = {
-                                "k": getattr(self.config.algorithm, "diversity_density_k", 4),
-                                "fallback_estimator": getattr(
-                                    self.config.algorithm, "diversity_density_fallback", "grpo"
-                                ),
-                                "use_metric": getattr(
-                                    self.config.algorithm,
-                                    "diversity_density_use_metric",
-                                    "consistency_rate",
-                                ),
-                                "consistency_threshold": getattr(
-                                    self.config.algorithm, "consistency_threshold", 0.0
-                                ),
-                                "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
-                                "c_max": getattr(self.config.algorithm, "c_max", 2.0),
-                                "tau_rep": getattr(self.config.algorithm, "tau_rep", 0.2),
-                                "gamma": getattr(self.config.algorithm, "gamma", 1.0),
-                                "p_max": getattr(self.config.algorithm, "p_max", 0.15),
-                                "n_gram_size": getattr(self.config.algorithm, "n_gram_size", 3),
-                                "use_rep_penalty": getattr(
-                                    self.config.algorithm, "use_rep_penalty", False
-                                ),
-                                "div_sc_threshold": getattr(
-                                    self.config.algorithm, "div_sc_threshold", 0.5
-                                ),
-                            }
-
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            diversity_density_config=diversity_density_config,
-                        )
-
-                        # Apply zero_advantage_mask if present
-                        if "zero_advantage_mask" in batch.non_tensor_batch:
-                            zero_mask = torch.tensor(
-                                batch.non_tensor_batch["zero_advantage_mask"],
-                                dtype=torch.float32,
-                                device=batch.batch["advantages"].device,
-                            ).unsqueeze(-1)
-                            batch.batch["advantages"] = batch.batch["advantages"] * (1.0 - zero_mask)
-                            n_zeroed = int(zero_mask.sum().item())
                             print(
-                                f"[test_minority] Applied zero_advantage_mask: "
-                                f"zeroed {n_zeroed}/{len(zero_mask)} samples"
-                            )
-                            metrics["train/test_minority_zeroed_ratio"] = float(
-                                zero_mask.mean().item()
+                                f"[Explore] Round 2 triggered for {len(low_indices)}/{prompt_num} "
+                                f"prompts ({metrics['explore/round2_sample_ratio']:.2%}), "
+                                f"threshold={self.explore_threshold}"
                             )
 
-                        # Log diversity density usage statistics if available
-                        if "diversity_density_ratio" in batch.meta_info:
-                            metrics["train/diversity_density_ratio"] = float(
-                                batch.meta_info["diversity_density_ratio"]
-                            )
-                        if "fallback_ratio" in batch.meta_info:
-                            metrics["train/fallback_ratio"] = float(
-                                batch.meta_info["fallback_ratio"]
-                            )
+                            uid_to_r2_majority = {}
+                            gen_batch_output_r2_full = None
 
-                        # === Advantage Bias Diagnostics ===
-                        if (
-                            "oracle_answer_types" in batch.non_tensor_batch
-                            and self.config.algorithm.adv_estimator == AdvantageEstimator.PASS_GRPO
-                            and diversity_density_config is not None
-                        ):
-                            try:
-                                oracle_adv, _ = core_algos.compute_pass_grpo_advantage(
-                                    token_level_rewards=batch.batch["token_level_rewards"],
-                                    response_mask=batch.batch["response_mask"],
-                                    index=batch.non_tensor_batch["uid"],
-                                    answer_types=batch.non_tensor_batch["oracle_answer_types"],
-                                    k=diversity_density_config["k"],
-                                )
-                                tta_adv = batch.batch["advantages"]
-
-                                tta_scalar = tta_adv.sum(-1)
-                                oracle_scalar = oracle_adv.sum(-1)
-                                valid = batch.batch["response_mask"].sum(-1) > 0
-
-                                if valid.any():
-                                    sign_match = (
-                                        (tta_scalar > 0) == (oracle_scalar > 0)
-                                    ).float()
-                                    metrics["diag/adv_sign_match_rate"] = (
-                                        sign_match[valid].mean().item()
-                                    )
-                                    metrics["diag/adv_mse"] = (
-                                        ((tta_scalar - oracle_scalar) ** 2)[valid].mean().item()
-                                    )
-                                    metrics["diag/adv_mean_bias"] = (
-                                        (tta_scalar - oracle_scalar)[valid].mean().item()
-                                    )
-                            except Exception as e:
-                                print(f"Warning: Advantage bias diagnostics failed: {e}")
-
-                        # Log pass_grpo diagnostic metrics if available
-                        if "pass_grpo/correct_ratio" in batch.meta_info:
-                            metrics["train/pass_grpo_correct_ratio"] = float(
-                                batch.meta_info["pass_grpo/correct_ratio"]
-                            )
-                        if "pass_grpo/avg_correct_advantage" in batch.meta_info:
-                            metrics["train/pass_grpo_avg_correct_adv"] = float(
-                                batch.meta_info["pass_grpo/avg_correct_advantage"]
-                            )
-                        if "pass_grpo/avg_incorrect_advantage" in batch.meta_info:
-                            metrics["train/pass_grpo_avg_incorrect_adv"] = float(
-                                batch.meta_info["pass_grpo/avg_incorrect_advantage"]
-                            )
-                        if "pass_grpo/avg_total_advantage" in batch.meta_info:
-                            metrics["train/pass_grpo_avg_total_adv"] = float(
-                                batch.meta_info["pass_grpo/avg_total_advantage"]
-                            )
-
-                        # Log diversity density advantage metrics
-                        if "diversity/avg_advantage" in batch.meta_info:
-                            metrics["train/diversity_avg_adv"] = float(
-                                batch.meta_info["diversity/avg_advantage"]
-                            )
-
-                        # Log bootstrap_passk metrics if available
-                        for bp_key in [
-                            "bootstrap_passk/num_low_prompts",
-                            "bootstrap_passk/num_high_prompts",
-                            "bootstrap_passk/low_ratio",
-                            "bootstrap_passk/avg_low_advantage",
-                            "bootstrap_passk/avg_high_advantage",
-                            "bootstrap_passk/avg_total_advantage",
-                        ]:
-                            if bp_key in batch.meta_info:
-                                metrics[f"train/{bp_key.replace('/', '_')}"] = float(
-                                    batch.meta_info[bp_key]
+                            # Stage 2: full-batch R2 generation to avoid subset alignment hangs.
+                            if low_indices:
+                                all_prompt_indices = list(range(prompt_num))
+                                explore_gen_batch = self._build_explore_gen_batch(
+                                    gen_batch, all_prompt_indices, consistency_results_r1
                                 )
 
-                        # Log pass_grpo_penalized metrics if available
-                        for pp_key in [
-                            "pass_grpo_penalized/avg_r_div",
-                            "pass_grpo_penalized/r_div_triggered_ratio",
-                            "pass_grpo_penalized/avg_raw_a_passk",
-                            "pass_grpo_penalized/avg_adv_raw",
-                            "pass_grpo_penalized/avg_total_advantage",
-                        ]:
-                            if pp_key in batch.meta_info:
-                                metrics[f"train/{pp_key.replace('/', '_')}"] = float(
-                                    batch.meta_info[pp_key]
+                                explore_gen_batch_padded, explore_pad_size = pad_dataproto_to_divisor(
+                                    explore_gen_batch, self.actor_rollout_wg.world_size
+                                )
+                                explore_output_padded = self.actor_rollout_wg.generate_sequences(
+                                    explore_gen_batch_padded
+                                )
+                                gen_batch_output_r2_full = unpad_dataproto(
+                                    explore_output_padded,
+                                    pad_size=explore_pad_size * self.n_votes_per_prompt,
                                 )
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                                tmp_batch_r2 = batch.repeat(
+                                    repeat_times=self.n_votes_per_prompt, interleave=True
+                                )
+                                tmp_batch_r2 = tmp_batch_r2.union(gen_batch_output_r2_full)
+                                consistency_results_r2 = self.reward_fn.compute_majority_and_consistency(
+                                    tmp_batch_r2
+                                )
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer("update_actor", timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                                uid_to_r2_majority = self._build_uid_majority_map(
+                                    batch, consistency_results_r2, low_indices
+                                )
+                                metrics["explore/r2_pseudo_label_count"] = len(uid_to_r2_majority)
 
-                    # validate
+                                if hasattr(self.reward_fn, "compute_accuracy"):
+                                    try:
+                                        r1_low_output = self._slice_prompt_groups(
+                                            gen_batch_output_r1,
+                                            low_indices,
+                                            self.n_votes_per_prompt,
+                                        )
+                                        r2_low_output = self._slice_prompt_groups(
+                                            gen_batch_output_r2_full,
+                                            low_indices,
+                                            self.n_votes_per_prompt,
+                                        )
+                                        r1_low_batch = batch[low_indices].repeat(
+                                            repeat_times=self.n_votes_per_prompt,
+                                            interleave=True,
+                                        ).union(r1_low_output)
+                                        r2_low_batch = batch[low_indices].repeat(
+                                            repeat_times=self.n_votes_per_prompt,
+                                            interleave=True,
+                                        ).union(r2_low_output)
+                                        r1_acc = self.reward_fn.compute_accuracy(r1_low_batch)
+                                        r2_acc = self.reward_fn.compute_accuracy(r2_low_batch)
+                                        metrics["explore/r1_low_consistency_acc"] = r1_acc
+                                        metrics["explore/r2_low_consistency_acc"] = r2_acc
+                                        metrics["explore/r2_r1_acc_gap"] = r2_acc - r1_acc
+                                    except Exception as e:
+                                        print(f"[Explore] WARNING: Failed to compute accuracy gap: {e}")
+
+                                del tmp_batch_r2, consistency_results_r2
+                                del explore_gen_batch, explore_gen_batch_padded, explore_output_padded
+                                self._release_memory_cache()
+                            else:
+                                metrics["explore/r2_pseudo_label_count"] = 0
+
+                            del tmp_batch_r1, consistency_results_r1
+                            self._release_memory_cache()
+
+                        if uid_to_r2_majority:
+                            overwritten = self._inject_pseudo_labels_by_uid(
+                                batch,
+                                uid_to_r2_majority,
+                                target_indices=low_indices,
+                            )
+                            metrics["explore/r1_pseudo_label_overwrites"] = overwritten
+
+                        # First backprop phase: R1 full batch
+                        train_batch_for_metrics = self._ppo_update_step(
+                            batch=batch,
+                            gen_batch_output=gen_batch_output_r1,
+                            metrics=metrics,
+                            timing_raw=timing_raw,
+                            prefix="r1",
+                            rollout_n=self.n_votes_per_prompt,
+                        )
+
+                        # Second backprop phase: R2 low-consistency subset only
+                        if low_indices and gen_batch_output_r2_full is not None:
+                            batch_r2_low = batch[low_indices]
+                            if uid_to_r2_majority:
+                                overwritten_r2 = self._inject_pseudo_labels_by_uid(
+                                    batch_r2_low,
+                                    uid_to_r2_majority,
+                                )
+                                metrics["explore/r2_pseudo_label_overwrites"] = overwritten_r2
+
+                            gen_batch_output_r2_low = self._slice_prompt_groups(
+                                gen_batch_output_r2_full,
+                                low_indices,
+                                self.n_votes_per_prompt,
+                            )
+
+                            train_batch_for_metrics = self._ppo_update_step(
+                                batch=batch_r2_low,
+                                gen_batch_output=gen_batch_output_r2_low,
+                                metrics=metrics,
+                                timing_raw=timing_raw,
+                                prefix="r2",
+                                rollout_n=self.n_votes_per_prompt,
+                            )
+                    else:
+                        rollout_n = (
+                            self.n_votes_per_prompt
+                            if self.use_ttrl
+                            else self.config.actor_rollout_ref.rollout.n
+                        )
+                        train_batch_for_metrics = self._ppo_update_step(
+                            batch=batch,
+                            gen_batch_output=gen_batch_output_r1,
+                            metrics=metrics,
+                            timing_raw=timing_raw,
+                            prefix=None,
+                            rollout_n=rollout_n,
+                        )
+
+                    # validate and checkpoint once after all update phases
                     if (
                         self.val_reward_fn is not None
                         and self.config.trainer.test_freq > 0
@@ -1057,25 +974,40 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             self._save_checkpoint()
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
-                metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+                metrics_batch = train_batch_for_metrics if train_batch_for_metrics is not None else batch
+
+                metrics.update(
+                    compute_data_metrics(
+                        batch=metrics_batch,
+                        use_critic=self.use_critic,
+                    )
+                )
+                metrics.update(
+                    compute_timing_metrics(
+                        batch=metrics_batch,
+                        timing_raw=timing_raw,
+                    )
+                )
                 n_gpus = self.resource_pool_manager.get_n_gpus()
                 metrics.update(
-                    compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus)
+                    compute_throughout_metrics(
+                        batch=metrics_batch,
+                        timing_raw=timing_raw,
+                        n_gpus=n_gpus,
+                    )
                 )
 
                 logger.log(data=metrics, step=self.global_steps)
 
                 # Explicitly free batch and metrics
-                del batch, batch_dict, metrics, timing_raw
+                del batch, batch_dict, metrics, timing_raw, train_batch_for_metrics, metrics_batch
                 if "gen_batch" in locals():
                     del gen_batch
-                if "gen_batch_output" in locals():
-                    del gen_batch_output
-                gc.collect()
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                if "gen_batch_output_r1" in locals():
+                    del gen_batch_output_r1
+                if "gen_batch_output_r2_full" in locals():
+                    del gen_batch_output_r2_full
+                self._release_memory_cache()
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

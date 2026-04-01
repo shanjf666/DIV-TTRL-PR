@@ -223,6 +223,7 @@ python -m verl.trainer.main_explore_ppo \
   algorithm.diversity_density_k=4 \
   +algorithm.use_explore_rollout=True \
   +algorithm.explore_threshold=$EXPLORE_THRESHOLD \
+  +algorithm.explore_kl_penalty=0.0001 \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \

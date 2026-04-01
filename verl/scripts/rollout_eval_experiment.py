@@ -168,45 +168,61 @@ def triggers_babbling(text, ngram_repeat_threshold=0.38, line_repeat_threshold=0
 # Judge Prompt
 # =====================================================
 
-SYSTEM_PROMPT = """# Role: 资深数学阅卷专家 (Expert Mathematics Evaluator)
-你现在的任务是对 AI 模型解答数学问题的过程和结果进行客观、严格的评分。"""
+SYSTEM_PROMPT = """# Role: Expert Mathematics Evaluator
+Your current task is to objectively and strictly grade the process and results of mathematical solutions provided by AI models.
 
-USER_TEMPLATE = """## 核心原则 (Core Principles)
-数学解答的评估必须以逻辑严密性和结果准确性为核心。你需要甄别模型是真正理解了问题，还是在通过“幻觉”或“胡言乱语”凑答案。
+## Absolute Directives
+1. You are the **evaluator**, not the test-taker. You are absolutely forbidden from attempting to solve the problem yourself or continuing an incomplete solution.
+2. You are absolutely forbidden from repeating or explaining the prompt instructions, such as the "Scoring Rubric" or "Zero-Point Triggers", in your output.
+3. Your output must strictly follow the prescribed format and must not contain any extraneous fluff.
+"""
 
-## 零分否决项 (Zero-Point Triggers - Hard Fails)
-如果【模型解答】触犯以下任何一条，请立刻停止评估，并给出 0 分：
-1. 无有效输出或乱码：输出完全无关的内容，或者未完成解答。
-2. 答案无法提取：虽然有正常的解题格式，但最终没有给出明确的结论，或者没有按照规范格式（如未包含在 \\boxed{{}} 中，或缺乏明显的“答：”标识）给出最终答案。
-3. 陷入死循环/大量重复：解题过程中出现大段毫无意义的废话重复、车轱辘话，或者陷入逻辑死循环（“Babbling”）。
+USER_TEMPLATE = """## Core Principles
+The evaluation of mathematical solutions must be centered on logical rigor and result accuracy. You need to distinguish whether the model genuinely understands the problem or is merely piecing together an answer through "hallucinations" or "babbling."
 
-## 评分维度与阶梯 (Scoring Rubric: 1 - 10)
-如果未触犯零分否决项，请基于以下数学特性进行打分：
+## Zero-Point Triggers (Hard Fails)
+If the <model_response> violates any of the following, stop the evaluation immediately and directly award 0 points:
+1. **Incomplete / Truncated**: The solution stops abruptly (e.g., truncated due to length limits) and fails to provide a final mathematical conclusion.
+2. **Answer Cannot Be Extracted**: The final answer is not presented in a standardized format (e.g., not enclosed in \\boxed{{}} or lacking a clear "Answer:" indicator), or multiple contradictory answers are given.
+3. **Gibberish & Infinite Loops**: The output contains completely irrelevant gibberish, large sections of meaningless repetitive text, circular reasoning, or falls into a logical infinite loop.
+4. **Parrot Behavior**: The model merely repeats the user's question or these evaluation criteria in its response.
 
-* 【1-3分】思路完全错误：最终答案错误。推理方向南辕北辙，使用了完全不适用的定理或公式，存在根本性的逻辑断层。
-* 【4-6分】方向正确但存在重大漏洞：使用了正确的解题思路或公式，但计算过程中出现严重错误，或者漏掉了题目中关键的限制条件（如忽略了定义域、正负号取舍等），导致最终结果错误。
-* 【7-9分】逻辑自洽但存在微小瑕疵：推理过程清晰，最终答案基本正确。但可能存在符号表达不规范、分数未化简、或者某些中间步骤略显跳跃和繁琐。
-* 【10分】完美解答：逻辑链条无懈可击，公式定理应用严谨，计算完全正确，最终答案清晰准确，且解题过程精炼高效。
+## Scoring Rubric (1 - 10)
+If no Zero-Point Triggers are violated, please score based on the following mathematical characteristics:
+* [1-3 Points] Completely wrong approach: The final answer is incorrect. The reasoning direction is entirely off, completely inapplicable theorems or formulas are used, and there are fundamental logical gaps.
+* [4-6 Points] Correct direction but major flaws: The correct problem-solving approach is used, but severe calculation errors occur, or crucial constraints are missed, leading to an incorrect final result.
+* [7-9 Points] Logically consistent but minor flaws: The reasoning process is clear, and the final answer is generally correct. However, there may be unstandardized notation, unsimplified fractions, or some intermediate steps that are slightly cumbersome.
+* [10 Points] Perfect solution: The logical chain is flawless, the application of formulas and theorems is rigorous, the calculation is completely correct, and the final answer is clear and accurate.
 
-## 评估步骤 (Evaluation Process)
-在给出分数前，请先按照以下步骤进行思考：
-1. 格式检查：检查是否触碰了【零分否决项】。
-2. 逻辑梳理：提炼【模型解答】的核心推理路径，与标准数学逻辑进行对比。
-3. 验算核对：核对解答中的关键计算步骤是否成立。
-4. 综合定级：结合【评分维度与阶梯】给出最终分数。
+---
+## Input Data
+Please carefully read the following content and evaluate it:
 
-## 输入数据 (Input Data)
-[用户问题]: {question}
-[模型解答]: {model_response}
+<question>
+{question}
+</question>
 
-## 输出格式 (Output Format)
-1. 先给出一句简短评语。
-2. 再严格把最终分数放到 \\boxed{{}} 里，例如 \\boxed{{8.5}}。
+<model_response>
+{model_response}
+</model_response>
+---
+
+## Strict Output Format
+You must ONLY output the following two parts. Do not include any other prefixes or suffixes:
+1. **Comment**: A single, brief sentence pointing out a fatal error or praising a highlight (keep it under 50 words).
+2. **Score**: Strictly enclose the final score within \\boxed{{}}.
+
+Example Output:
+Comment: The model used a correct complex vector approach, but the solution was truncated midway and failed to provide the final square of the perimeter.
+\\boxed{{0}}
 """
 
 
 def build_eval_prompt(question, model_response, tokenizer):
-    content = USER_TEMPLATE.format(question=question, model_response=model_response)
+    # 使用 replace 避免模板格式化与 LaTeX 花括号冲突
+    content = USER_TEMPLATE.replace("{question}", str(question)).replace(
+        "{model_response}", str(model_response)
+    )
     if tokenizer:
         try:
             prompt = tokenizer.apply_chat_template(
@@ -290,12 +306,21 @@ def collect_extracted_answers(item, responses):
     ext = item.get("extracted_answers")
     if isinstance(ext, list) and len(ext) == len(responses):
         out = []
-        for x in ext:
+        for i, x in enumerate(ext):
             if x is None:
-                out.append("[NO_ANSWER]")
+                # 提供了 extracted_answers 但该位为空时，回退到从原始 response 再提取
+                ans = extract_answer(responses[i])
+                norm = strip_string(ans) if ans is not None else ""
+                out.append(norm if norm else "[NO_ANSWER]")
             else:
-                sx = str(x).strip()
-                out.append(sx if sx else "[NO_ANSWER]")
+                # 必须做归一化，避免 1/2 与  1/2  这类字符串差异影响一致性
+                sx = strip_string(str(x))
+                if sx and sx != "[NO_ANSWER]":
+                    out.append(sx)
+                else:
+                    ans = extract_answer(responses[i])
+                    norm = strip_string(ans) if ans is not None else ""
+                    out.append(norm if norm else "[NO_ANSWER]")
         return out
 
     out = []
