@@ -148,7 +148,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                 # Apply chat template (think mode disabled for R2 to avoid OOM)
                 modified_prompt = self.tokenizer.apply_chat_template(
-                    new_messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                    new_messages, add_generation_prompt=True, tokenize=False
                 )
             else:
                 # Original fallback: Manual string injection for Base models without full message history
@@ -377,10 +377,8 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                             # --- Round 2: Extract pseudo-labels (if needed) ---
                             if low_indices:
-                                # Clean up tmp_batch before generating R2
                                 del tmp_batch
                                 gc.collect()
-                                torch.cuda.empty_cache()
 
                                 # Build self-verify prompts for low-consistency samples
                                 explore_gen_batch = self._build_explore_gen_batch(
@@ -451,11 +449,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 del explore_output_padded, explore_output
                                 del r2_meta_batch, r2_eval_batch
                                 gc.collect()
-                                torch.cuda.empty_cache()
                             else:
                                 del tmp_batch
                                 gc.collect()
-                                torch.cuda.empty_cache()
+
 
                     # ============================================================
                     # REMAX baseline (unchanged from original)
@@ -778,7 +775,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     batch.meta_info[pp_key]
                                 )
 
-                    # Clear large unabridged tensors generated during rollout to free GPU PyTorch memory before FSDP backward passes
                     if self.use_ttrl:
                         if "gen_batch_output" in locals(): del gen_batch_output
                         if "old_log_prob" in locals(): del old_log_prob
@@ -786,7 +782,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                         if "values" in locals(): del values
                         if "reward_tensor" in locals(): del reward_tensor
                         gc.collect()
-                        torch.cuda.empty_cache()
 
                     # update critic
                     if self.use_critic:
@@ -839,8 +834,6 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     del gen_batch_output
                 gc.collect()
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

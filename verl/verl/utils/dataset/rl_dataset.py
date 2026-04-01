@@ -129,7 +129,7 @@ class RLHFDataset(Dataset):
                 if getattr(tokenizer, "chat_template", None):
                     return len(
                         tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, enable_thinking=False
+                            doc[prompt_key], add_generation_prompt=True
                         )
                     )
                 messages = doc[prompt_key]
@@ -230,7 +230,7 @@ class RLHFDataset(Dataset):
         else:
             if getattr(self.tokenizer, "chat_template", None):
                 raw_prompt = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=False, enable_thinking=False
+                    messages, add_generation_prompt=True, tokenize=False
                 )
             else:
                 try:
