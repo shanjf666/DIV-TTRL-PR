@@ -326,7 +326,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
-                            assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt
+                            assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt, (
+                                f"[Explore R1] gen_batch_output size {len(gen_batch_output)} != "
+                                f"batch({len(batch)}) * n_votes({self.n_votes_per_prompt}) = "
+                                f"{len(batch) * self.n_votes_per_prompt}"
+                            )
 
                     # ============================================================
                     # Two-Stage Exploration (if enabled)
@@ -339,6 +343,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 repeat_times=self.n_votes_per_prompt, interleave=True
                             )
                             tmp_batch = tmp_batch.union(gen_batch_output)
+
+                            # [ASSERTION] tmp_batch should have batch_size * n_votes rows
+                            expected_tmp_size = len(batch) * self.n_votes_per_prompt
+                            assert len(tmp_batch) == expected_tmp_size, (
+                                f"[Explore] tmp_batch size {len(tmp_batch)} != "
+                                f"batch({len(batch)}) * n_votes({self.n_votes_per_prompt}) = {expected_tmp_size}"
+                            )
 
                             # Sort by index for correct per-prompt grouping (if multiple entries of same prompt exist)
                             # Note: This is local to tmp_batch so it doesn't affect the Actor training order
@@ -363,6 +374,12 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 else:
                                     low_indices.append(i)
 
+                            # [ASSERTION] All prompts must be classified
+                            assert len(high_indices) + len(low_indices) == prompt_num, (
+                                f"[Explore] high({len(high_indices)}) + low({len(low_indices)}) "
+                                f"!= total prompts({prompt_num})"
+                            )
+
                             round2_count = len(low_indices)
                             round2_ratio = round2_count / prompt_num if prompt_num > 0 else 0.0
 
@@ -385,6 +402,16 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
                             # --- Round 2: Extract pseudo-labels (if needed) ---
                             if low_indices:
+                                # Compute R1 accuracy on low-consistency prompts (before freeing tmp_batch)
+                                r1_low_sample_indices = []
+                                for idx in low_indices:
+                                    start = idx * self.n_votes_per_prompt
+                                    end = start + self.n_votes_per_prompt
+                                    r1_low_sample_indices.extend(range(start, end))
+                                r1_low_batch = tmp_batch[r1_low_sample_indices]
+                                r1_low_acc = self.reward_fn.compute_accuracy(r1_low_batch)
+                                del r1_low_batch
+
                                 del tmp_batch
                                 gc.collect()
 
@@ -420,6 +447,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     explore_output_padded, pad_size=explore_pad_size * self.n_votes_per_prompt
                                 )
 
+                                # [ASSERTION] R2 output must have low_count * n_votes rows
+                                expected_r2_size = len(low_indices) * self.n_votes_per_prompt
+                                assert len(explore_output) == expected_r2_size, (
+                                    f"[Explore R2] explore_output size {len(explore_output)} != "
+                                    f"low_count({len(low_indices)}) * n_votes({self.n_votes_per_prompt}) = {expected_r2_size}"
+                                )
+
                                 # Extract R2 majority answers as pseudo-labels
                                 # Build metadata batch from original batch for low-consistency prompts
                                 low_batch_indices = [i for i in low_indices]
@@ -433,10 +467,29 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     r2_eval_batch
                                 )
 
+                                # Compute R2 accuracy on the same low-consistency prompts
+                                r2_acc = self.reward_fn.compute_accuracy(r2_eval_batch)
+
+                                # Log R1/R2 accuracy and the gap
+                                acc_gap = r2_acc - r1_low_acc
+                                metrics["explore/r1_low_acc"] = r1_low_acc
+                                metrics["explore/r2_acc"] = r2_acc
+                                metrics["explore/r2_r1_acc_gap"] = acc_gap
+                                print(
+                                    f"[Explore] Accuracy gap: R1_low_acc={r1_low_acc:.4f}, "
+                                    f"R2_acc={r2_acc:.4f}, gap={acc_gap:+.4f}"
+                                )
+
                                 # Inject R2 majority as verified labels into gen_batch_output
                                 # gen_batch_output has n_prompts * n_votes rows
                                 total_samples = len(gen_batch_output)
                                 explore_labels = np.array([None] * total_samples, dtype=object)
+
+                                # [ASSERTION] R2 consistency results match low_indices count
+                                assert len(r2_consistency) == len(low_indices), (
+                                    f"[Explore R2] r2_consistency count {len(r2_consistency)} != "
+                                    f"low_indices count {len(low_indices)}"
+                                )
 
                                 r2_consistency_rates = []
                                 r2_success_count = 0
@@ -446,6 +499,13 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                     r2_rate = r2_consistency[r2_idx]["consistency_rate"]
                                     start = prompt_idx * self.n_votes_per_prompt
                                     end = start + self.n_votes_per_prompt
+
+                                    # [ASSERTION] Label injection indices must be within bounds
+                                    assert end <= total_samples, (
+                                        f"[Explore R2] label injection out of bounds: "
+                                        f"end={end} > total_samples={total_samples} "
+                                        f"(prompt_idx={prompt_idx}, n_votes={self.n_votes_per_prompt})"
+                                    )
                                     explore_labels[start:end] = r2_majority
                                     
                                     r2_consistency_rates.append(r2_rate)
@@ -503,6 +563,14 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                     batch = batch.repeat(
                         repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
                     )
+
+                    # [ASSERTION] Before union: repeated batch and gen_batch_output must match
+                    assert len(batch) == len(gen_batch_output), (
+                        f"[Explore PPO] batch size after repeat ({len(batch)}) != "
+                        f"gen_batch_output size ({len(gen_batch_output)}). "
+                        f"rollout.n={self.config.actor_rollout_ref.rollout.n}"
+                    )
+
                     batch = batch.union(gen_batch_output)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -863,6 +931,8 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 if "gen_batch_output" in locals():
                     del gen_batch_output
                 gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
 
                 if is_last_step:

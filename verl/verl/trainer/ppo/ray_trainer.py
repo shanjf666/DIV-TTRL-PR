@@ -332,6 +332,11 @@ def compute_advantage(
                 data.meta_info[k_met] = float(v_met.item())
             # Skip other tensor types to avoid memory leaks
         
+        # Explicitly delete metrics dict to free memory
+        del metrics
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         data.meta_info["pass_grpo_penalized/avg_total_advantage"] = advantages.mean().item()
     else:
         raise NotImplementedError
@@ -761,6 +766,15 @@ class RayPPOTrainer:
             for key, val in result["ttrl_info"].items():
                 metric_dict[f"val-ttrl/{key}"] = val
 
+        # Clean up memory explicitly to prevent OOM in subsequent generation
+        import gc
+        del test_batch, test_gen_batch, test_gen_batch_padded, test_output_gen_batch
+        del input_ids, output_ids
+        gc.collect()
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         return metric_dict
 
     def init_workers(self):
@@ -1046,21 +1060,15 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        # NOTE: Do NOT set sampling_kwargs["n"] here!
-                        # rollout.n (set at line ~1041) already tells the rollout framework
-                        # to repeat each prompt n times. Adding sampling_kwargs["n"] on top
-                        # would cause vLLM to generate n responses per ALREADY-DUPLICATED
-                        # prompt, resulting in n*n total responses and complete data misalignment.
                         gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         if self.use_ttrl:
-                            expected_size = len(batch) * self.n_votes_per_prompt
-                            actual_size = len(gen_batch_output)
-                            assert actual_size == expected_size, (
-                                f"[TTRL] gen_batch_output size mismatch: "
-                                f"expected {len(batch)} * {self.n_votes_per_prompt} = {expected_size}, "
-                                f"got {actual_size}. "
-                                f"If actual > expected, sampling_kwargs['n'] may be double-expanding."
+                            assert len(gen_batch_output) == len(batch) * self.n_votes_per_prompt, (
+                                f"[PPO R1] gen_batch_output size {len(gen_batch_output)} != "
+                                f"batch({len(batch)}) * n_votes({self.n_votes_per_prompt}) = "
+                                f"{len(batch) * self.n_votes_per_prompt}"
                             )
+                        else:
+                            pass
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with _timer("gen_max", timing_raw):
                             gen_baseline_batch = deepcopy(gen_batch)
@@ -1082,6 +1090,14 @@ class RayPPOTrainer:
                     )
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+
+                    # [ASSERTION] Before union: repeated batch and gen_batch_output must match
+                    assert len(batch) == len(gen_batch_output), (
+                        f"[PPO] batch size after repeat ({len(batch)}) != "
+                        f"gen_batch_output size ({len(gen_batch_output)}). "
+                        f"rollout.n={self.config.actor_rollout_ref.rollout.n}"
+                    )
+
                     batch = batch.union(gen_batch_output)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1330,28 +1346,6 @@ class RayPPOTrainer:
                             if pp_key in batch.meta_info:
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(batch.meta_info[pp_key])
 
-
-                    # Clear large unabridged tensors and strings generated during rollout to free Host RAM
-                    if self.use_ttrl:
-                        if "gen_batch_output" in locals(): del gen_batch_output
-                        if "old_log_prob" in locals(): del old_log_prob
-                        if "ref_log_prob" in locals(): del ref_log_prob
-                        if "values" in locals(): del values
-                        if "reward_tensor" in locals(): del reward_tensor
-                        if "reward_result" in locals(): del reward_result
-                        
-                        # Dehydrate batch: remove long string arrays to save memory before Ray transmission
-                        keys_to_pop = [
-                            "solutions", "extracted_answers", "answer_types", "oracle_answer_types",
-                            "raw_prompt", "raw_prompt_ids", "consistency_rate", "accuracy_rate",
-                            "label_accuracy", "zero_advantage_mask"
-                        ]
-                        for k in keys_to_pop:
-                            batch.non_tensor_batch.pop(k, None)
-
-                        import gc
-                        gc.collect()
-
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -1395,9 +1389,18 @@ class RayPPOTrainer:
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
+                # Explicitly free batch and metrics from this step to prevent memory leaks from python's delayed GC
+                del batch, batch_dict, metrics, timing_raw
+                if 'gen_batch' in locals():
+                    del gen_batch
+                if 'gen_batch_output' in locals():
+                    del gen_batch_output
                 import gc
                 gc.collect()
-
+                
+                # Force GPU cache cleanup to prevent accumulation of unused tensors
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")

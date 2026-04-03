@@ -227,26 +227,25 @@ class vLLMRollout(BaseRollout):
                     f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}"
                 )
 
-        kwargs = prompts.meta_info.get("sampling_kwargs", {}).copy()
-
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
         if not do_sample:
-            kwargs.update({
+            kwargs = {
                 "best_of": 1,
                 "top_p": 1.0,
                 "top_k": -1,
                 "min_p": 0.0,
                 "temperature": 0,
                 "n": 1,  # if greedy, only 1 response
-            })
+            }
         elif is_validate:
-            kwargs.update({
+            # TODO: try **
+            kwargs = {
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
                 "n": 1,  # if validate, already repeat in ray_trainer
-            })
+            }
 
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**kwargs):
@@ -264,20 +263,29 @@ class vLLMRollout(BaseRollout):
                 for sample_id in range(len(output.outputs)):
                     response.append(output.outputs[sample_id].token_ids)
 
-            # Pad to a globally consistent maximum length to prevent DP concatenation crashes.
-            # If 'max_tokens' was dynamically injected, we use that as the target shape.
-            pad_max_len = kwargs.get("max_tokens", self.config.response_length)
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=pad_max_len).to(
+            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(
                 idx.device
             )
 
             if self.sampling_params.n > 1 and do_sample:
+                original_batch_size = batch_size
                 idx = _repeat_interleave(idx, self.sampling_params.n)
                 attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
                 position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
                 batch_size = batch_size * self.sampling_params.n
-                for key in non_tensor_batch.keys():
-                    non_tensor_batch[key] = _repeat_interleave(non_tensor_batch[key], self.sampling_params.n)
+
+                # Keep non-tensor fields aligned with the repeated tensor batch.
+                for key, val in list(non_tensor_batch.items()):
+                    if isinstance(val, np.ndarray) and val.shape[0] == original_batch_size:
+                        non_tensor_batch[key] = _repeat_interleave(val, self.sampling_params.n)
+
+                # [ASSERTION] Verify non-tensor batch alignment after n>1 interleave
+                for key, val in non_tensor_batch.items():
+                    if isinstance(val, np.ndarray):
+                        assert val.shape[0] == batch_size, (
+                            f"[vLLM Rollout] non_tensor_batch['{key}'] has shape {val.shape[0]} "
+                            f"but expected {batch_size} (original_bs={original_batch_size}, n={self.sampling_params.n})"
+                        )
 
             seq = torch.cat([idx, response], dim=-1)
 
@@ -314,5 +322,13 @@ class vLLMRollout(BaseRollout):
         # free vllm cache engine
         if vllm_version in ("0.3.1", "0.4.2", "0.5.4", "0.6.3") and self.config.free_cache_engine:
             self.inference_engine.free_cache_engine()
+
+        # [ASSERTION] Final consistency check: tensor batch_size must match all non-tensor arrays
+        for key, val in non_tensor_batch.items():
+            if isinstance(val, np.ndarray):
+                assert val.shape[0] == batch_size, (
+                    f"[vLLM Rollout] FINAL CHECK: non_tensor_batch['{key}'] size {val.shape[0]} != "
+                    f"tensor batch_size {batch_size}"
+                )
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)

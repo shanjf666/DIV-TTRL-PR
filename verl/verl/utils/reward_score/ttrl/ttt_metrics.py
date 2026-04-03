@@ -17,18 +17,11 @@ def test_time_train_metrics(
     ground_truth = ground_truth[0]
 
     model_answers = auto_extract(task, solutions, extra_info=extra_info)
-    # Filter out empty/invalid answers so only parseable answers participate in voting
-    valid_answers = [a for a in model_answers if a is not None and str(a).strip() != ""]
+    counter = Counter(model_answers)
     
-    if len(valid_answers) == 0:
-        # No valid answer could be extracted — use "0" as fallback pseudo-label
-        estimated_label = "0"
-        majority_count = 0
-        majority_ratio = 0.0
-    else:
-        counter = Counter(valid_answers)
-        estimated_label, majority_count = counter.most_common(1)[0]
-        majority_ratio = majority_count / len(solutions)
+    estimated_label, majority_count = counter.most_common(1)[0]
+    
+    majority_ratio = majority_count / len(solutions)
     
     if verified_label is not None:
         estimated_label = verified_label
@@ -70,9 +63,8 @@ def post_test_time_train_metrics(
     ground_truth = ground_truth[0]
 
     model_answers = auto_extract(task, solutions, extra_info=extra_info)
-    valid_answers = [a for a in model_answers if a is not None and str(a).strip() != ""]
 
-    counter = Counter(valid_answers)
+    counter = Counter(model_answers)
     
     # true_label_ratio = counter.get(ground_truth, 0) / len(solutions)
 

@@ -272,6 +272,47 @@ class TTRLRewardManager:
 
         return results
 
+    def compute_accuracy(self, data: DataProto):
+        """
+        Compute the mean accuracy of the given data against the ground truth.
+        """
+        assert len(data) % self.n_votes_per_prompt == 0, (
+            f"Length of data {len(data)} should be divisible by n_votes_per_prompt {self.n_votes_per_prompt}"
+        )
+        prompt_num = len(data) // self.n_votes_per_prompt
+
+        all_true_rewards = []
+        for prompt_i in range(prompt_num):
+            group_pred_outputs = []
+            group_labels = []
+            group_extra_info = []
+            task = None
+
+            for i in range(self.n_votes_per_prompt):
+                data_item = data[prompt_i * self.n_votes_per_prompt + i]
+                prompt_idx = data_item.batch["prompts"]
+                prompt_length = prompt_idx.shape[-1]
+                response_idx = data_item.batch["responses"]
+                valid_response_length = data_item.batch["attention_mask"][prompt_length:].sum()
+                valid_response_idx = response_idx[:valid_response_length]
+
+                response_str = self.tokenizer.decode(valid_response_idx, skip_special_tokens=False)
+                ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
+                data_source = data_item.non_tensor_batch[self.reward_fn_key]
+                extra_info = data_item.non_tensor_batch["extra_info"]
+
+                if task is None:
+                    task = self._data_source_to_task(data_source)
+
+                group_labels.append(ground_truth)
+                group_pred_outputs.append(response_str)
+                group_extra_info.append(extra_info)
+
+            true_rewards, _ = auto_verify(task, group_pred_outputs, group_labels, extra_info=group_extra_info)
+            all_true_rewards.extend([1.0 if r > 0 else 0.0 for r in true_rewards])
+
+        return sum(all_true_rewards) / len(all_true_rewards) if all_true_rewards else 0.0
+
     def _compute_ttrl_reward(self, data: DataProto):
 
             reward_extra_info = defaultdict(list)

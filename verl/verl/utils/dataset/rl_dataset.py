@@ -127,11 +127,7 @@ class RLHFDataset(Dataset):
             def _doc_len(doc) -> int:
                 # Prefer tokenizer.chat_template; else simple fallback
                 if getattr(tokenizer, "chat_template", None):
-                    return len(
-                        tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True
-                        )
-                    )
+                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True, enable_thinking=False))
                 messages = doc[prompt_key]
                 try:
                     text = (
@@ -199,7 +195,7 @@ class RLHFDataset(Dataset):
         if self.processor is not None and (self.image_key in row_dict or self.video_key in row_dict):
             from verl.utils.dataset.vision_utils import process_image, process_video
 
-            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            raw_prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=False)
             multi_modal_data = {}
 
             images = None
@@ -229,9 +225,7 @@ class RLHFDataset(Dataset):
 
         else:
             if getattr(self.tokenizer, "chat_template", None):
-                raw_prompt = self.tokenizer.apply_chat_template(
-                    messages, add_generation_prompt=True, tokenize=False
-                )
+                raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False, enable_thinking=False)
             else:
                 try:
                     raw_prompt = (
@@ -283,8 +277,9 @@ class RLHFDataset(Dataset):
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
 
         row_dict["raw_prompt_ids"] = raw_prompt_ids
-        # Always store raw messages for explore trainer's Round 2 prompt construction
-        row_dict["raw_prompt"] = messages
+        # encode prompts without chat template
+        if self.return_raw_chat:
+            row_dict["raw_prompt"] = messages
 
         # add index for each prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
