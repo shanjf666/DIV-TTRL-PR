@@ -366,7 +366,15 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                             round2_count = len(low_indices)
                             round2_ratio = round2_count / prompt_num if prompt_num > 0 else 0.0
 
+                            # Compute R1 averages
+                            r1_sc_all = [r["consistency_rate"] for r in consistency_results]
+                            r1_sc_high = [consistency_results[i]["consistency_rate"] for i in high_indices]
+                            r1_sc_low = [consistency_results[i]["consistency_rate"] for i in low_indices]
+                            
                             # Log explore metrics
+                            metrics["explore/r1_consistency_avg_all"] = sum(r1_sc_all) / len(r1_sc_all) if r1_sc_all else 0.0
+                            metrics["explore/r1_consistency_avg_high"] = sum(r1_sc_high) / len(r1_sc_high) if r1_sc_high else 0.0
+                            metrics["explore/r1_consistency_avg_low"] = sum(r1_sc_low) / len(r1_sc_low) if r1_sc_low else 0.0
                             metrics["explore/round2_sample_quantity"] = round2_count
                             metrics["explore/round2_sample_ratio"] = round2_ratio
 
@@ -430,18 +438,29 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                                 total_samples = len(gen_batch_output)
                                 explore_labels = np.array([None] * total_samples, dtype=object)
 
+                                r2_consistency_rates = []
+                                r2_success_count = 0
+
                                 for r2_idx, prompt_idx in enumerate(low_indices):
                                     r2_majority = r2_consistency[r2_idx]["majority_answer"]
                                     r2_rate = r2_consistency[r2_idx]["consistency_rate"]
                                     start = prompt_idx * self.n_votes_per_prompt
                                     end = start + self.n_votes_per_prompt
                                     explore_labels[start:end] = r2_majority
+                                    
+                                    r2_consistency_rates.append(r2_rate)
+                                    if r2_majority is not None and r2_majority != "None" and r2_majority != "":
+                                        r2_success_count += 1
+                                    
                                     print(
                                         f"  [Explore] Prompt {prompt_idx}: "
                                         f"R1 majority='{consistency_results[prompt_idx]['majority_answer']}' "
                                         f"(sc={consistency_results[prompt_idx]['consistency_rate']:.2f}) → "
                                         f"R2 majority='{r2_majority}' (sc={r2_rate:.2f})"
                                     )
+                                
+                                metrics["explore/r2_consistency_avg"] = sum(r2_consistency_rates) / len(r2_consistency_rates) if r2_consistency_rates else 0.0
+                                metrics["explore/r2_success_ratio"] = r2_success_count / len(low_indices) if low_indices else 0.0
 
                                 gen_batch_output.non_tensor_batch["explore_verified_label"] = explore_labels
 
@@ -781,6 +800,17 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                         if "ref_log_prob" in locals(): del ref_log_prob
                         if "values" in locals(): del values
                         if "reward_tensor" in locals(): del reward_tensor
+                        if "reward_result" in locals(): del reward_result
+                        
+                        # Dehydrate batch: remove long string arrays to save memory before Ray transmission
+                        keys_to_pop = [
+                            "solutions", "extracted_answers", "answer_types", "oracle_answer_types",
+                            "raw_prompt", "raw_prompt_ids", "consistency_rate", "accuracy_rate",
+                            "label_accuracy", "zero_advantage_mask"
+                        ]
+                        for k in keys_to_pop:
+                            batch.non_tensor_batch.pop(k, None)
+
                         gc.collect()
 
                     # update critic

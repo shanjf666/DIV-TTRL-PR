@@ -1331,6 +1331,26 @@ class RayPPOTrainer:
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(batch.meta_info[pp_key])
 
 
+                    # Clear large unabridged tensors and strings generated during rollout to free Host RAM
+                    if self.use_ttrl:
+                        if "gen_batch_output" in locals(): del gen_batch_output
+                        if "old_log_prob" in locals(): del old_log_prob
+                        if "ref_log_prob" in locals(): del ref_log_prob
+                        if "values" in locals(): del values
+                        if "reward_tensor" in locals(): del reward_tensor
+                        if "reward_result" in locals(): del reward_result
+                        
+                        # Dehydrate batch: remove long string arrays to save memory before Ray transmission
+                        keys_to_pop = [
+                            "solutions", "extracted_answers", "answer_types", "oracle_answer_types",
+                            "raw_prompt", "raw_prompt_ids", "consistency_rate", "accuracy_rate",
+                            "label_accuracy", "zero_advantage_mask"
+                        ]
+                        for k in keys_to_pop:
+                            batch.non_tensor_batch.pop(k, None)
+
+                        import gc
+                        gc.collect()
 
                     # update critic
                     if self.use_critic:
