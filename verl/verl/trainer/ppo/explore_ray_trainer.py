@@ -73,6 +73,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         self.explore_threshold = getattr(self.config.algorithm, "explore_threshold", 0.5)
 
         # Default self-verify prompt template. {problem} and {majority_answer} will be replaced.
+        default_system = "You are an expert mathematical checker and solver. Carefully inspect suspicious solutions and re-solve problems correctly step by step."
         default_template = (
             "[Problem]\n"
             "{problem}\n\n"
@@ -81,9 +82,11 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             "{majority_answer}\n\n"
             "[Task]\n"
             "Please solve the problem step by step.\n"
-            "IMPORTANT: The previous answer ({majority_answer}) is likely wrong due to low consistency. "
-            "Please explore a completely different reasoning path and provide an alternative answer.\n"
+            "IMPORTANT: The previous answer ({majority_answer}) is likely wrong due to low consistency. Please explore a completely different reasoning path and provide an alternative answer.\n"
             "Conclude your final answer strictly enclosed in \\boxed{{}}."
+        )
+        self.explore_system_prompt = getattr(
+            self.config.algorithm, "explore_system_prompt", default_system
         )
         self.explore_prompt_template = getattr(
             self.config.algorithm, "explore_prompt_template", default_template
@@ -103,6 +106,52 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             )
 
     # ------------------------------------------------------------------ #
+    #  Helper: Detect chat template format
+    # ------------------------------------------------------------------ #
+    def _detect_chat_format(self, prompt_text: str):
+        """
+        Dynamically detect the chat format (e.g. ChatML, Llama-3, Gemma)
+        to cleanly insert the explore system message and question.
+        Returns a dictionary of formatting start/end strings.
+        """
+        # ChatML format (Qwen)
+        if "<|im_start|>" in prompt_text:
+            return {
+                "format": "chatml",
+                "system_start": "<|im_start|>system\n",
+                "user_start": "<|im_start|>user\n", 
+                "assistant_start": "<|im_start|>assistant\n",
+                "end": "<|im_end|>\n",
+            }
+        # Llama-3 format
+        elif "<|start_header_id|>" in prompt_text:
+            return {
+                "format": "llama3",
+                "system_start": "<|start_header_id|>system<|end_header_id|>\n\n",
+                "user_start": "<|start_header_id|>user<|end_header_id|>\n\n",
+                "assistant_start": "<|start_header_id|>assistant<|end_header_id|>\n\n",
+                "end": "<|eot_id|>",
+            }
+        # Gemma format
+        elif "<start_of_turn>" in prompt_text:
+            return {
+                "format": "gemma",
+                "system_start": "",  # Gemma doesn't have system role
+                "user_start": "<start_of_turn>user\n",
+                "assistant_start": "<start_of_turn>model\n",
+                "end": "<end_of_turn>\n",
+            }
+        # Plain text fallback
+        else:
+            return {
+                "format": "plain",
+                "system_start": "System: ",
+                "user_start": "\n\nUser: ",
+                "assistant_start": "\n\nAssistant: ",
+                "end": "\n",
+            }
+
+    # ------------------------------------------------------------------ #
     #  Helper: Build self-verify generation batch for low-consistency prompts
     # ------------------------------------------------------------------ #
     def _build_explore_gen_batch(self, gen_batch, low_indices, consistency_results, original_raw_prompts=None):
@@ -114,7 +163,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             gen_batch: Original generation batch (batch_size prompts).
             low_indices: List of prompt indices that need round 2.
             consistency_results: List of dicts with majority_answer / consistency_rate.
-            original_raw_prompts: Pre-generation copy of raw_prompt messages (before vLLM interleave).
+            original_raw_prompts: Pre-generation copy of raw_prompt messages (unused in new logic).
 
         Returns:
             DataProto: New batch ready for ``generate_sequences``.
@@ -122,61 +171,70 @@ class RayExplorePPOTrainer(RayPPOTrainer):
         new_input_ids_list = []
 
         for prompt_idx in low_indices:
-            # Get the majority answer to build the verification prompt
+            # Decode original prompt from input_ids (left-padded)
+            original_ids = gen_batch.batch["input_ids"][prompt_idx]
+            original_mask = gen_batch.batch["attention_mask"][prompt_idx]
+            valid_length = int(original_mask.sum().item())
+            valid_ids = original_ids[-valid_length:]
+
+            original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
             result = consistency_results[prompt_idx]
             majority_answer = result.get("majority_answer", "None")
 
-            # Use saved original messages (before vLLM interleave corruption)
-            messages = None
-            if original_raw_prompts is not None:
-                messages = list(original_raw_prompts[prompt_idx])
+            # Detect chat format dynamically
+            chat_format = self._detect_chat_format(original_prompt)
 
-            if messages is not None:
-                # Replace the original problem text with the fully structured template
-                new_messages = deepcopy(messages)
-                if new_messages and new_messages[-1]["role"] == "user":
-                    problem = new_messages[-1]["content"]
-                    new_messages[-1]["content"] = self.explore_prompt_template.format(
-                        problem=problem, majority_answer=majority_answer
-                    )
+            # Extract original problem from the prompt using detected format
+            problem_text = original_prompt
+            user_marker = chat_format["user_start"]
+            end_marker = chat_format["end"]
+
+            if user_marker and user_marker in original_prompt:
+                start_idx = original_prompt.find(user_marker) + len(user_marker)
+                end_idx = original_prompt.find(end_marker, start_idx)
+                if end_idx != -1:
+                    problem_text = original_prompt[start_idx:end_idx].strip()
                 else:
-                    problem = new_messages[-1]["content"] if new_messages else ""
-                    verify_text = self.explore_prompt_template.format(
-                        problem=problem, majority_answer=majority_answer
-                    )
-                    new_messages.append({"role": "user", "content": verify_text})
+                    problem_text = original_prompt[start_idx:].strip()
 
-                # Apply chat template (think mode disabled for R2 to avoid OOM)
-                modified_prompt = self.tokenizer.apply_chat_template(
-                    new_messages, add_generation_prompt=True, tokenize=False
+            # Truncate majority_answer if extremely long to prevent OOM
+            max_ans_chars = 2000
+            ans_str = str(majority_answer) if majority_answer is not None else "unknown"
+            if len(ans_str) > max_ans_chars:
+                ans_str = ans_str[:max_ans_chars] + "... (truncated)"
+
+            # Format the target template
+            verify_text = self.explore_prompt_template.format(
+                problem=problem_text,
+                majority_answer=ans_str
+            )
+
+            # Reconstruct the prompt using detected format
+            if chat_format["format"] == "chatml":
+                modified_prompt = (
+                    f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                    f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
+                )
+            elif chat_format["format"] == "llama3":
+                modified_prompt = (
+                    f"<|begin_of_text|>"
+                    f"{chat_format['system_start']}{self.explore_system_prompt}{chat_format['end']}"
+                    f"{chat_format['user_start']}{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
+                )
+            elif chat_format["format"] == "gemma":
+                modified_prompt = (
+                    f"<bos>"
+                    f"{chat_format['user_start']}{self.explore_system_prompt}\n\n{verify_text}{chat_format['end']}"
+                    f"{chat_format['assistant_start']}"
                 )
             else:
-                # Original fallback: Manual string injection for Base models without full message history
-                original_ids = gen_batch.batch["input_ids"][prompt_idx]
-                original_mask = gen_batch.batch["attention_mask"][prompt_idx]
-                valid_length = int(original_mask.sum().item())
-                valid_ids = original_ids[-valid_length:]
-                original_prompt = self.tokenizer.decode(valid_ids, skip_special_tokens=False)
-
-                verify_text = self.explore_prompt_template.format(
-                    problem="", majority_answer=majority_answer
+                modified_prompt = (
+                    f"System: {self.explore_system_prompt}\n\n"
+                    f"User: {verify_text}\n\n"
+                    f"Assistant: "
                 )
-
-                assistant_marker = "<|im_start|>assistant"
-                if assistant_marker in original_prompt:
-                    insert_pos = original_prompt.rfind(assistant_marker)
-                    end_marker = "<|im_end|>"
-                    end_pos = original_prompt.rfind(end_marker, 0, insert_pos)
-                    if end_pos >= 0:
-                        modified_prompt = (
-                            original_prompt[:end_pos] + "\n\n" + verify_text + original_prompt[end_pos:]
-                        )
-                    else:
-                        modified_prompt = (
-                            original_prompt[:insert_pos] + "\n\n" + verify_text + "\n" + original_prompt[insert_pos:]
-                        )
-                else:
-                    modified_prompt = original_prompt + "\n\n" + verify_text
 
             # Re-tokenize
             new_ids = self.tokenizer.encode(modified_prompt, add_special_tokens=False)
@@ -184,13 +242,12 @@ class RayExplorePPOTrainer(RayPPOTrainer):
 
             # Print first modified prompt for debugging
             if prompt_idx == low_indices[0]:
-                original_len = int(gen_batch.batch["attention_mask"][prompt_idx].sum().item())
                 print(f"[Explore] Modified prompt (first sample, idx={prompt_idx}):")
-                print(f"  Original length: {original_len}, New length: {len(new_ids)}")
-                # Print the last 200 chars to verify injection
+                print(f"  Original length: {valid_length}, New length: {len(new_ids)}")
+                print(f"  Chat format: {chat_format['format']}")
                 print(f"  ...{modified_prompt[-200:]}")
 
-        # Pad to same length (left-pad with pad_token_id)
+        # Pad to same length within this batch (left-pad with pad_token_id)
         max_len = max(len(ids) for ids in new_input_ids_list)
         pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
 
@@ -208,7 +265,10 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 torch.zeros(pad_len, dtype=torch.long),
                 torch.ones(len(ids), dtype=torch.long),
             ])
-            pos_ids = (mask.cumsum(dim=-1) - 1).clamp(min=0)
+            pos_ids = torch.cat([
+                torch.zeros(pad_len, dtype=torch.long),
+                torch.arange(len(ids), dtype=torch.long),
+            ])
 
             padded_input_ids.append(padded)
             attention_masks.append(mask)
@@ -223,13 +283,19 @@ class RayExplorePPOTrainer(RayPPOTrainer):
             "position_ids": torch.stack(position_ids_list).to(device),
         }
 
-        # Update raw_prompt_ids to match the new modified prompts
+        # Carry over raw_prompt_ids for the selected indices
         non_tensors = {}
         non_tensors["raw_prompt_ids"] = np.array(
             [ids.tolist() for ids in new_input_ids_list], dtype=object
         )
         if "raw_prompt" in gen_batch.non_tensor_batch:
             non_tensors["raw_prompt"] = gen_batch.non_tensor_batch["raw_prompt"][
+                np.array(low_indices)
+            ]
+
+        # Carry over extra_info for the selected indices
+        if "extra_info" in gen_batch.non_tensor_batch:
+            non_tensors["extra_info"] = gen_batch.non_tensor_batch["extra_info"][
                 np.array(low_indices)
             ]
 
