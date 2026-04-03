@@ -208,7 +208,7 @@ class RayExplorePPOTrainer(RayPPOTrainer):
                 torch.zeros(pad_len, dtype=torch.long),
                 torch.ones(len(ids), dtype=torch.long),
             ])
-            pos_ids = torch.arange(max_len, dtype=torch.long)
+            pos_ids = (mask.cumsum(dim=-1) - 1).clamp(min=0)
 
             padded_input_ids.append(padded)
             attention_masks.append(mask)
