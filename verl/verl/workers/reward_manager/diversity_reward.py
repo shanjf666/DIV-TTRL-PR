@@ -19,9 +19,13 @@ This manager mirrors the structure of ``SemanticTTRLRewardManager`` but removes
 semantic embedding calls. It adjusts negative rewards using a count-based
 diversity score computed within each prompt group.
 
+
+due to the result of our ablation study, we had abandoned the non-linear scaling in favor of a simpler fractional scaling to ensure stability and interpretability. 
+The diversity ratio is also returned for metric logging.
+so this is basically a other version of TTRL reward manager with a different diversity metric.
+
 For each prompt group (rollout):
     diversity_term_i = (unique_answers - 1) / (rollout - majority_num) * (1 / c_i)
-    final_reward_i = -1 + 0.5 * diversity_term_i   (for negative samples)
 where:
     - ``unique_answers`` is the number of distinct decoded answers in the group.
     - ``majority_num`` is the maximum frequency of any single answer.
@@ -196,6 +200,8 @@ class DiversityTTRLRewardManager:
     ) -> tuple[list[float], float]:
         """
         Apply count-based diversity adjustment to negative rewards within a prompt group.
+        but we had abandoned the non-linear scaling in favor of a simpler fractional scaling to ensure stability and interpretability.
+        The diversity ratio is also returned for metric logging.
         """
         n_answers = len(pred_outputs)
         final_answers = self._extract_final_answers(task, pred_outputs)
@@ -206,31 +212,31 @@ class DiversityTTRLRewardManager:
         diversity_ratio = unique_answers / n_answers if n_answers > 0 else 0.0
         denom = n_answers - majority_num
 
-        final_rewards: list[float] = []
-        for idx, base_reward in enumerate(base_rewards):
-            if base_reward > 0:
-                diversity_reward = (unique_answers)/n_answers
-                diversity_reward = max(0.0, min(diversity_reward, 1.0))
-                adjusted_reward = 0.5 + 0.5 * diversity_reward
-                adjusted_reward = max(0.5, min(adjusted_reward, 1.0))
-                final_rewards.append(float(adjusted_reward))
-                # final_rewards.append(float(base_reward))
-                continue
+        # final_rewards: list[float] = []
+        # for idx, base_reward in enumerate(base_rewards):
+        #     if base_reward > 0:
+        #         diversity_reward = (unique_answers)/n_answers
+        #         diversity_reward = max(0.0, min(diversity_reward, 1.0))
+        #         adjusted_reward = 0.5 + 0.5 * diversity_reward
+        #         adjusted_reward = max(0.5, min(adjusted_reward, 1.0))
+        #         final_rewards.append(float(adjusted_reward))
+        #         # final_rewards.append(float(base_reward))
+        #         continue
 
-            ci = freq.get(final_answers[idx], 1)
-            diversity_term = 0.0
-            if unique_answers > 1 and denom > 0:
-                # use factional scaling
-                diversity_term = ((unique_answers - 1) / denom) * (1.0 / ci)
-                # use non-linear scaling
-                # diversity_term = ((unique_answers - 1) / denom) * cos(ci/ (self.n_votes_per_prompt / 2 ) * (pi / 2))
-                # use linear scaling
-                # diversity_term = ((unique_answers - 1) / denom) * (1- (ci) / (self.n_votes_per_prompt/2 ))
-                diversity_term = max(0.0, min(diversity_term, 1.0))
+        #     ci = freq.get(final_answers[idx], 1)
+        #     diversity_term = 0.0
+        #     if unique_answers > 1 and denom > 0:
+        #         # use factional scaling
+        #         diversity_term = ((unique_answers - 1) / denom) * (1.0 / ci)
+        #         # use non-linear scaling
+        #         # diversity_term = ((unique_answers - 1) / denom) * cos(ci/ (self.n_votes_per_prompt / 2 ) * (pi / 2))
+        #         # use linear scaling
+        #         # diversity_term = ((unique_answers - 1) / denom) * (1- (ci) / (self.n_votes_per_prompt/2 ))
+        #         diversity_term = max(0.0, min(diversity_term, 1.0))
 
-            adjusted_reward = -1.0 + diversity_term
-            adjusted_reward = max(-1.0, min(adjusted_reward, -0.5))
-            final_rewards.append(float(adjusted_reward))
+        #     adjusted_reward = -1.0 + diversity_term
+        #     adjusted_reward = max(-1.0, min(adjusted_reward, -0.5))
+        #     final_rewards.append(float(adjusted_reward))
 
         # 返回最终奖励以及本组的多样性比率，调用方负责把该指标写入 ttrl_metrics
         return base_rewards, float(diversity_ratio)

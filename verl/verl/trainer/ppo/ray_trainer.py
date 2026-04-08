@@ -81,11 +81,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS_BASELINE = "reinforce_plus_plus_baseline"
     REMAX = "remax"
     RLOO = "rloo"
-    DIVERSITY_DENSITY = "diversity_density"
-    DIVERSITY_DENSITY_HYBRID = "diversity_density_hybrid"
     PASS_GRPO = "pass_grpo"
-    SELECTIVE_PASSK = "selective_passk"
-    ADAPTIVE_PASSK = "adaptive_passk"
     PASS_GRPO_PENALIZED = "pass_grpo_penalized"
 
 @dataclass
@@ -197,14 +193,10 @@ def compute_advantage(
     gamma=1.0,
     lam=1.0,
     num_repeat=1,
-    diversity_density_config: dict = None
+    diversity_density_config: dict = None,
 ):
     """
     Compute advantage for different estimators.
-    
-    For DIVERSITY_DENSITY_HYBRID, the function implements probability-based selection:
-    - With probability p (self-consistency rate): use diversity density advantage
-    - With probability (1-p): use fallback estimator (default: GRPO)
     
     Args:
         data: DataProto containing batch data
@@ -212,12 +204,7 @@ def compute_advantage(
         gamma: Discount factor for GAE/REINFORCE++
         lam: Lambda for GAE
         num_repeat: Number of repeats
-        diversity_density_config: Config dict for diversity density estimator, containing:
-            - fallback_estimator: str, e.g., "grpo", "rloo"
-            - k: int, group size (typically n_votes_per_prompt)
-            - consistency_threshold: float, threshold for switching selection mode (default: 0.0)
-                - When consistency_rate < threshold: deterministically use diversity density
-                - When consistency_rate >= threshold: probabilistically select based on consistency_rate
+        diversity_density_config: Dict containing PASS_GRPO specific configs
     
     Returns:
         data: DataProto with advantages and returns added
@@ -280,180 +267,11 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.DIVERSITY_DENSITY:
-        # Pure diversity density advantage
-        if diversity_density_config is None:
-            diversity_density_config = {}
-        
-        k = diversity_density_config.get("k", 8)
-        
-        # Need answer_types from non_tensor_batch
-        if "answer_types" not in data.non_tensor_batch:
-            raise ValueError("DIVERSITY_DENSITY requires 'answer_types' in data.non_tensor_batch")
-        
-        advantages, returns = core_algos.compute_diversity_density_advantage_from_prompts(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            answer_types=data.non_tensor_batch["answer_types"],
-            k=k,
-        )
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.DIVERSITY_DENSITY_HYBRID:
-        # Hybrid mode: probabilistically select between diversity density and fallback
-        if diversity_density_config is None:
-            diversity_density_config = {}
-        
-        k = diversity_density_config.get("k", 4)
-        fallback = diversity_density_config.get("fallback_estimator", "pass_grpo")
-        
-        # Get self-consistency rate per prompt from non_tensor_batch
-        # This should be passed in by the reward manager
-        consistency_rates = data.non_tensor_batch.get("consistency_rate", None)
-        answer_types = data.non_tensor_batch.get("answer_types", None)
-        
-        if consistency_rates is None or answer_types is None:
-            # Fallback to standard estimator if missing data
-            fallback_estimator = AdvantageEstimator(fallback)
-            return compute_advantage(data, fallback_estimator, gamma, lam, num_repeat)
-        
-        # Compute both advantages
-        # 1. Diversity density advantage
-        div_advantages, div_returns = core_algos.compute_diversity_density_advantage_from_prompts(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            answer_types=answer_types,
-            k=k,
-        )
-        
-        # 2. Fallback advantage (e.g., GRPO)
-        if fallback == "grpo":
-            fallback_advantages, fallback_returns = core_algos.compute_grpo_outcome_advantage(
-                token_level_rewards=data.batch["token_level_rewards"],
-                response_mask=data.batch["response_mask"],
-                index=data.non_tensor_batch["uid"],
-            )
-        elif fallback == "pass_grpo":
-            fallback_advantages, fallback_returns = core_algos.compute_pass_grpo_advantage(
-                token_level_rewards=data.batch["token_level_rewards"],
-                response_mask=data.batch["response_mask"],
-                index=data.non_tensor_batch["uid"],
-                answer_types=answer_types,
-                k=k,
-            ) 
-        elif fallback == "rloo":
-            fallback_advantages, fallback_returns = core_algos.compute_rloo_outcome_advantage(
-                token_level_rewards=data.batch["token_level_rewards"],
-                response_mask=data.batch["response_mask"],
-                index=data.non_tensor_batch["uid"],
-            )
-        else:
-            # Default to GRPO
-            fallback_advantages, fallback_returns = core_algos.compute_grpo_outcome_advantage(
-                token_level_rewards=data.batch["token_level_rewards"],
-                response_mask=data.batch["response_mask"],
-                index=data.non_tensor_batch["uid"],
-            )
-        
-        # ========== [2026-01-27 MODIFIED] ==========
-        # modify the select logits
-        
-        # 3. Deterministic selection per prompt based on label_accuracy (pseudo-label correctness)
-        bs = data.batch["token_level_rewards"].shape[0]
-        device = data.batch["token_level_rewards"].device
-        dtype = data.batch["token_level_rewards"].dtype
-        
-        # Use label_accuracy for deterministic selection
-        # label_accuracy = 1.0 means majority vote is correct -> use fallback
-        # label_accuracy = 0.0 means majority vote is wrong -> use diversity density
-        label_accuracies = data.non_tensor_batch.get("label_accuracy", None)
-        use_metric = diversity_density_config.get("use_metric", "consistency_rate")
-        accuracy_rates = data.non_tensor_batch.get("accuracy_rate", None)
-        consistency_rates = data.non_tensor_batch.get("consistency_rate", None)
-        
-        # Get consistency_threshold from config (default 0.0 means always probabilistic)
-        consistency_threshold = diversity_density_config.get("consistency_threshold", 0.0)
-        
-        if use_metric == "label_accuracies" and label_accuracies is not None:
-            # Deterministic: use_diversity = 1 when label_accuracy = 0 (wrong pseudo-label)
-            use_diversity = torch.tensor(1.0 - label_accuracies, dtype=dtype, device=device).unsqueeze(-1)  # (bs, 1)
-        else:
-            # Get consistency rate values
-            if use_metric == "accuracy_rates" and accuracy_rates is not None:
-                p = torch.tensor(accuracy_rates, dtype=dtype, device=device)
-            elif consistency_rates is not None:
-                p = torch.tensor(consistency_rates, dtype=dtype, device=device)
-            else:
-                # No metrics available: default to fallback (p=1 means always use fallback)
-                p = torch.ones(bs, dtype=dtype, device=device)
-            
-            # Threshold-based selection with probabilistic blending:
-            # - When p > threshold: advantages = 0 (skip training)
-            # - When p <= threshold: probabilistic selection with (1-p) for diversity, p for fallback
-            
-            # Create mask for samples that should be trained (p <= threshold)
-            train_mask = (p <= consistency_threshold).float().unsqueeze(-1)  # (bs, 1)
-            
-            # For trainable samples, probabilistic selection per prompt
-            uids = data.non_tensor_batch["uid"]
-            unique_uids = list(dict.fromkeys(uids))
-            uid_to_random = {uid: torch.rand(1, device=device, dtype=dtype).item() for uid in unique_uids}
-            random_vals = torch.tensor([uid_to_random[uid] for uid in uids], dtype=dtype, device=device)
-            
-            # random < (1-p) -> use diversity, random >= (1-p) -> use fallback
-            use_diversity = (random_vals < (1 - p)).float().unsqueeze(-1)  # (bs, 1)
-            
-            # Blend advantages: trainable samples get blended advantage, others get 0
-            blended_advantages = use_diversity * div_advantages + (1 - use_diversity) * fallback_advantages
-            blended_returns = use_diversity * div_returns + (1 - use_diversity) * fallback_returns
-            
-            advantages = train_mask * blended_advantages  # p > threshold samples get 0
-            returns = train_mask * blended_returns
-        
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        
-        # Calculate and store diversity density usage statistics for logging
-        # Per-prompt usage: count samples using diversity density
-        num_using_diversity = use_diversity.sum().item()
-        num_total = bs
-        diversity_usage_ratio = num_using_diversity / num_total if num_total > 0 else 0.0
-        
-        # Store in meta_info (not non_tensor_batch, which requires matching batch size)
-        data.meta_info["diversity_density_ratio"] = diversity_usage_ratio
-        data.meta_info["fallback_ratio"] = 1.0 - diversity_usage_ratio
-        
-        # ========== [2026-02-03 NEW] ==========
-        # Add comprehensive diagnostic metrics for pass_grpo and diversity_density
-        # ===========================================
-        if answer_types is not None:
-            answer_types_tensor = torch.tensor(answer_types, dtype=torch.long, device=device)
-            correct_mask = (answer_types_tensor == 0)  # answer_type == 0 means correct (matches majority)
-            num_correct = correct_mask.sum().item()
-            num_incorrect = bs - num_correct
-            correct_ratio = num_correct / bs if bs > 0 else 0.0
-            
-            # Store pass_grpo diagnostic metrics
-            data.meta_info["pass_grpo/correct_ratio"] = correct_ratio
-            
-            # Calculate average advantage for correct vs incorrect samples (fallback/pass_grpo)
-            if num_correct > 0:
-                data.meta_info["pass_grpo/avg_correct_advantage"] = fallback_advantages[correct_mask].mean().item()
-            if num_incorrect > 0:
-                data.meta_info["pass_grpo/avg_incorrect_advantage"] = fallback_advantages[~correct_mask].mean().item()
-            
-            # Fallback (pass_grpo) total average advantage
-            data.meta_info["pass_grpo/avg_total_advantage"] = fallback_advantages.mean().item()
-        
-        # Diversity density advantage metrics
-        data.meta_info["diversity/avg_advantage"] = div_advantages.mean().item()
     elif adv_estimator == AdvantageEstimator.PASS_GRPO:
         # Pass@k reweighted GRPO advantage
         if diversity_density_config is None:
             diversity_density_config = {}
-        
+            
         k = diversity_density_config.get("k", 8)
         
         # Need answer_types from non_tensor_batch
@@ -469,172 +287,10 @@ def compute_advantage(
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.SELECTIVE_PASSK:
-        # ========== [2026-02-19 NEW] ==========
-        # Selective Pass@k: compute pass_grpo advantage, but only update prompts
-        # whose consistency_rate > threshold. Others get zero advantage.
-        # =======================================
-        if diversity_density_config is None:
-            diversity_density_config = {}
-        
-        k = diversity_density_config.get("k", 4)
-        threshold = diversity_density_config.get("selective_passk_threshold", 0.7)
-        
-        # Need answer_types from non_tensor_batch
-        if "answer_types" not in data.non_tensor_batch:
-            raise ValueError("SELECTIVE_PASSK requires 'answer_types' in data.non_tensor_batch")
-        
-        # 1. Compute standard pass_grpo advantages for all samples
-        advantages, returns = core_algos.compute_pass_grpo_advantage(
-            token_level_rewards=data.batch["token_level_rewards"],
-            response_mask=data.batch["response_mask"],
-            index=data.non_tensor_batch["uid"],
-            answer_types=data.non_tensor_batch["answer_types"],
-            k=k,
-        )
-        
-        # 2. Apply consistency rate threshold gating
-        consistency_rates = data.non_tensor_batch.get("consistency_rate", None)
-        
-        if consistency_rates is not None:
-            bs = advantages.shape[0]
-            device = advantages.device
-            dtype = advantages.dtype
-            uids = data.non_tensor_batch["uid"]
-            
-            # Build per-prompt consistency rate mapping
-            prompt_consistency = {}
-            for i in range(bs):
-                uid = uids[i]
-                if uid not in prompt_consistency:
-                    prompt_consistency[uid] = consistency_rates[i]
-            
-            # Create mask: 1.0 for prompts with consistency_rate > threshold, 0.0 otherwise
-            select_mask = torch.zeros(bs, 1, dtype=dtype, device=device)
-            for i in range(bs):
-                uid = uids[i]
-                if prompt_consistency[uid] <= threshold:
-                    select_mask[i] = 1.0
-            
-            # Zero out advantages for unselected prompts
-            advantages = advantages * select_mask
-            returns = returns * select_mask
-            
-            # Diagnostic metrics
-            num_prompts = len(prompt_consistency)
-            num_selected = sum(1 for cr in prompt_consistency.values() if cr <= threshold)
-            num_skipped = num_prompts - num_selected
-            
-            data.meta_info["selective_passk/num_prompts"] = num_prompts
-            data.meta_info["selective_passk/num_selected"] = num_selected
-            data.meta_info["selective_passk/num_skipped"] = num_skipped
-            data.meta_info["selective_passk/select_ratio"] = num_selected / num_prompts if num_prompts > 0 else 0.0
-            data.meta_info["selective_passk/threshold"] = threshold
-            
-            # Log average consistency rate for selected vs skipped
-            selected_crs = [cr for cr in prompt_consistency.values() if cr >= threshold]
-            skipped_crs = [cr for cr in prompt_consistency.values() if cr < threshold]
-            if selected_crs:
-                data.meta_info["selective_passk/avg_selected_consistency"] = sum(selected_crs) / len(selected_crs)
-            if skipped_crs:
-                data.meta_info["selective_passk/avg_skipped_consistency"] = sum(skipped_crs) / len(skipped_crs)
-        else:
-            # No consistency_rate available: behave like standard pass_grpo (no filtering)
-            print("[selective_passk] Warning: consistency_rate not found in non_tensor_batch, falling back to pass_grpo behavior")
-        
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-    elif adv_estimator == AdvantageEstimator.ADAPTIVE_PASSK:
-        # ========== [2026-02-22 NEW] ==========
-        # Adaptive Pass@k: dynamically select k per prompt based on SC ratio
-        # SC < 0.3  → k=4 (noisy labels, moderate signal)
-        # 0.3 ≤ SC < 0.7 → k=2 (reliable labels, strong optimization)
-        # SC ≥ 0.7  → k=6 (high confidence, preserve diversity)
-        # =======================================
-        
-        if "answer_types" not in data.non_tensor_batch:
-            raise ValueError("ADAPTIVE_PASSK requires 'answer_types' in data.non_tensor_batch")
-        
-        consistency_rates = data.non_tensor_batch.get("consistency_rate", None)
-        if consistency_rates is None:
-            raise ValueError("ADAPTIVE_PASSK requires 'consistency_rate' in data.non_tensor_batch")
-        
-        answer_types = data.non_tensor_batch["answer_types"]
-        uids = data.non_tensor_batch["uid"]
-        bs, response_length = data.batch["token_level_rewards"].shape
-        device = data.batch["token_level_rewards"].device
-        dtype = data.batch["token_level_rewards"].dtype
-        
-        # 1. Determine per-prompt k based on SC ratio
-        prompt_k = {}  # uid -> k
-        for i in range(bs):
-            uid = uids[i]
-            if uid not in prompt_k:
-                sc = consistency_rates[i]
-                if sc < 0.3:
-                    prompt_k[uid] = 4
-                elif sc < 0.7:
-                    prompt_k[uid] = 2
-                else:
-                    prompt_k[uid] = 6
-        
-        # 2. Group prompts by their assigned k value
-        k_to_indices = {}  # k -> list of sample indices
-        for i in range(bs):
-            uid = uids[i]
-            k_val = prompt_k[uid]
-            if k_val not in k_to_indices:
-                k_to_indices[k_val] = []
-            k_to_indices[k_val].append(i)
-        
-        # 3. Compute advantages per k-group
-        advantages = torch.zeros(bs, response_length, dtype=dtype, device=device)
-        returns = torch.zeros(bs, response_length, dtype=dtype, device=device)
-        
-        for k_val, indices in k_to_indices.items():
-            indices_tensor = torch.tensor(indices, dtype=torch.long)
-            
-            # Extract sub-batch for this k-group
-            sub_rewards = data.batch["token_level_rewards"][indices_tensor]
-            sub_mask = data.batch["response_mask"][indices_tensor]
-            sub_uids = np.array([uids[i] for i in indices])
-            sub_answer_types = np.array([answer_types[i] for i in indices])
-            
-            sub_adv, sub_ret = core_algos.compute_pass_grpo_advantage(
-                token_level_rewards=sub_rewards,
-                response_mask=sub_mask,
-                index=sub_uids,
-                answer_types=sub_answer_types,
-                k=k_val,
-            )
-            
-            # Scatter back into full-size tensors
-            advantages[indices_tensor] = sub_adv
-            returns[indices_tensor] = sub_ret
-        
-        data.batch["advantages"] = advantages
-        data.batch["returns"] = returns
-        
-        # 4. Diagnostic metrics
-        k_values = [prompt_k[uid] for uid in dict.fromkeys(uids)]  # unique prompts, preserving order
-        avg_k = sum(k_values) / len(k_values) if k_values else 0
-        k_counts = {}
-        for kv in k_values:
-            k_counts[kv] = k_counts.get(kv, 0) + 1
-        
-        data.meta_info["adaptive_passk/avg_k"] = avg_k
-        for kv, cnt in k_counts.items():
-            data.meta_info[f"adaptive_passk/num_prompts_k{kv}"] = cnt
-        data.meta_info["adaptive_passk/num_prompts_total"] = len(k_values)
-        # Log advantage statistics
-        if advantages.abs().sum() > 0:
-            nonzero_mask = advantages.abs().sum(dim=-1) > 0
-            if nonzero_mask.any():
-                data.meta_info["adaptive_passk/avg_advantage"] = advantages[nonzero_mask].mean().item()
     elif adv_estimator == AdvantageEstimator.PASS_GRPO_PENALIZED:
         if diversity_density_config is None:
             diversity_density_config = {}
-        
+            
         k = diversity_density_config.get("k", 4)
         epsilon = diversity_density_config.get("epsilon", 1e-6)
         
@@ -658,16 +314,13 @@ def compute_advantage(
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
         
-        # Log metrics to meta_info (only scalar values to avoid tensor memory leak)
+        # Log scalar metrics to meta_info
         for k_met, v_met in metrics.items():
             if isinstance(v_met, (int, float)):
                 data.meta_info[k_met] = v_met
             elif isinstance(v_met, torch.Tensor) and v_met.numel() == 1:
-                # Only store scalar tensors, convert to Python float
                 data.meta_info[k_met] = float(v_met.item())
-            # Skip other tensor types to avoid memory leaks
         
-        # Explicitly delete metrics dict to free memory
         del metrics
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -739,11 +392,7 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.DIVERSITY_DENSITY,
-            AdvantageEstimator.DIVERSITY_DENSITY_HYBRID,
             AdvantageEstimator.PASS_GRPO,
-            AdvantageEstimator.SELECTIVE_PASSK,
-            AdvantageEstimator.ADAPTIVE_PASSK,
             AdvantageEstimator.PASS_GRPO_PENALIZED,
         ]:
             self.use_critic = False
@@ -1545,43 +1194,18 @@ class RayPPOTrainer:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
                         # compute advantages, executed on the driver process
-                        # Prepare diversity density config if using hybrid estimator
-                        diversity_density_config = None
-                        if self.config.algorithm.adv_estimator in [
-                            AdvantageEstimator.DIVERSITY_DENSITY,
-                            AdvantageEstimator.DIVERSITY_DENSITY_HYBRID,
-                            AdvantageEstimator.PASS_GRPO,
-                            AdvantageEstimator.SELECTIVE_PASSK,
-                            AdvantageEstimator.ADAPTIVE_PASSK,
-                            AdvantageEstimator.PASS_GRPO_PENALIZED,
-                        ]:
-                            diversity_density_config = {
-                                "k": getattr(self.config.algorithm, "diversity_density_k", 4),
-                                "fallback_estimator": getattr(
-                                    self.config.algorithm, "diversity_density_fallback", "grpo"
-                                ),
-                                "use_metric": getattr(
-                                    self.config.algorithm, "diversity_density_use_metric", "consistency_rate"
-                                ),
-                                "consistency_threshold": getattr(
-                                    self.config.algorithm, "consistency_threshold", 0.0
-                                ),
-                                "selective_passk_threshold": getattr(
-                                    self.config.algorithm, "selective_passk_threshold", 0.5
-                                ),
-                                "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
-                                "c_max": getattr(self.config.algorithm, "c_max", 2.0),
-                                "tau_rep": getattr(self.config.algorithm, "tau_rep", 0.2),
-                                "gamma": getattr(self.config.algorithm, "gamma", 1.0),
-                                "p_max": getattr(self.config.algorithm, "p_max", 0.15),
-                                "n_gram_size": getattr(self.config.algorithm, "n_gram_size", 3),
-                                "use_rep_penalty": getattr(self.config.algorithm, "use_rep_penalty", False),
-                                "div_sc_threshold": getattr(self.config.algorithm, "div_sc_threshold", 0.5),
-                            }
-                        
+                        # Prepare configuration for advantage estimators
+                        diversity_density_config = {
+                            "k": getattr(self.config.algorithm, "diversity_density_k", 8),
+                            "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
+                            "c_max": getattr(self.config.algorithm, "c_max", 2.0),
+                            "div_sc_threshold": getattr(self.config.algorithm, "div_sc_threshold", 0.3),
+                            "epsilon": getattr(self.config.algorithm, "epsilon", 1e-6)
+                        }
+
                         batch = compute_advantage(
                             batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
+                            adv_estimator=self.config.algorithm.adv_estimator, 
                             gamma=self.config.algorithm.gamma,
                             lam=self.config.algorithm.lam,
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
@@ -1600,27 +1224,20 @@ class RayPPOTrainer:
                             n_zeroed = int(zero_mask.sum().item())
                             print(f"[test_minority] Applied zero_advantage_mask: zeroed {n_zeroed}/{len(zero_mask)} samples")
                             metrics["train/test_minority_zeroed_ratio"] = float(zero_mask.mean().item())
-
-                        # Log diversity density usage statistics if available
-                        if "diversity_density_ratio" in batch.meta_info:
-                            metrics["train/diversity_density_ratio"] = float(batch.meta_info["diversity_density_ratio"])
-                        if "fallback_ratio" in batch.meta_info:
-                            metrics["train/fallback_ratio"] = float(batch.meta_info["fallback_ratio"])
                         
-                        # === Advantage Bias Diagnostics ===
-                        # Compare TTA advantage (from pseudo-labels) with Oracle advantage (from true labels)
+                        # === Advantage Bias Diagnostics (PASS_GRPO only) ===
                         if (
                             "oracle_answer_types" in batch.non_tensor_batch
                             and self.config.algorithm.adv_estimator == AdvantageEstimator.PASS_GRPO
-                            and diversity_density_config is not None
                         ):
                             try:
+                                # Use default k value for oracle advantage calculation
                                 oracle_adv, _ = core_algos.compute_pass_grpo_advantage(
                                     token_level_rewards=batch.batch["token_level_rewards"],
                                     response_mask=batch.batch["response_mask"],
                                     index=batch.non_tensor_batch["uid"],
                                     answer_types=batch.non_tensor_batch["oracle_answer_types"],
-                                    k=diversity_density_config["k"],
+                                    k=4,
                                 )
                                 tta_adv = batch.batch["advantages"]
                                 
@@ -1655,44 +1272,6 @@ class RayPPOTrainer:
                         # Log diversity density advantage metrics
                         if "diversity/avg_advantage" in batch.meta_info:
                             metrics["train/diversity_avg_adv"] = float(batch.meta_info["diversity/avg_advantage"])
-                        
-                        # Log selective_passk metrics if available
-                        for sp_key in [
-                            "selective_passk/num_prompts",
-                            "selective_passk/num_selected",
-                            "selective_passk/num_skipped",
-                            "selective_passk/select_ratio",
-                            "selective_passk/threshold",
-                            "selective_passk/avg_selected_consistency",
-                            "selective_passk/avg_skipped_consistency",
-                        ]:
-                            if sp_key in batch.meta_info:
-                                metrics[f"train/{sp_key.replace('/', '_')}"] = float(batch.meta_info[sp_key])
-
-                        # Log adaptive_passk metrics if available
-                        for ap_key in [
-                            "adaptive_passk/avg_k",
-                            "adaptive_passk/num_prompts_total",
-                            "adaptive_passk/num_prompts_k2",
-                            "adaptive_passk/num_prompts_k4",
-                            "adaptive_passk/num_prompts_k6",
-                            "adaptive_passk/avg_advantage",
-                        ]:
-                            if ap_key in batch.meta_info:
-                                metrics[f"train/{ap_key.replace('/', '_')}"] = float(batch.meta_info[ap_key])
-
-                        # Log bootstrap_passk metrics if available
-                        for bp_key in [
-                            "bootstrap_passk/num_low_prompts",
-                            "bootstrap_passk/num_high_prompts",
-                            "bootstrap_passk/low_ratio",
-                            "bootstrap_passk/avg_low_advantage",
-                            "bootstrap_passk/avg_high_advantage",
-                            "bootstrap_passk/avg_total_advantage",
-                        ]:
-                            if bp_key in batch.meta_info:
-                                metrics[f"train/{bp_key.replace('/', '_')}"] = float(batch.meta_info[bp_key])
-                                
                         # Log pass_grpo_penalized metrics if available
                         for pp_key in [
                             "pass_grpo_penalized/avg_r_div",

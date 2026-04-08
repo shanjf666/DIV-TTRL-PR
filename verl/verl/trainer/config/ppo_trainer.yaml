@@ -186,7 +186,6 @@ reward_model:
     n_samples_per_prompt: 8
     n_votes_per_prompt: 8
     mode: "train"
-    noise_rate: 0.3
 
 custom_reward_function:
   path: null
@@ -196,11 +195,7 @@ algorithm:
   gamma: 1.0
   lam: 1.0
   adv_estimator: gae
-  diversity_density_fallback: grpo   # fallback estimator for DIVERSITY_DENSITY_HYBRID (grpo/pass_grpo/rloo)
-  diversity_density_k: 4             # group size k for diversity density calculation
-  diversity_density_use_metric: consistency_rate  # metric for advantage estimator selection (label_accuracies/accuracy_rates/consistency_rate)
-  consistency_threshold: 0.7
-  selective_passk_threshold: 0.9  # threshold for selective_passk: only update prompts with consistency_rate > threshold
+  diversity_density_k: 4             # group size k for advantage calculation
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
