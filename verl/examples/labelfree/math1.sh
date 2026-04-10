@@ -166,9 +166,9 @@ else
 fi
 
 # Set EPISODE
-EPISODE=4
-DATA_TRAIN_BATCH_SIZE=32
-N_VOTES_PER_PROMPT=64 # Reduce candidates to balance computational overhead
+EPISODE=5
+DATA_TRAIN_BATCH_SIZE=16
+N_VOTES_PER_PROMPT=32 # Reduce candidates to balance computational overhead
 N_SAMPLES_PER_PROMPT=32 # Keep training sample count
 MINI_BATCH_SIZE=1 # Actual mini batch size is MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT - increase mini batch
 MICRO_BATCH_SIZE=2 # Increase micro batch to better utilize GPU
@@ -180,7 +180,7 @@ if [[ "$BACKBONE" == *"/"* ]]; then
   BACKBONE_PATH="$BACKBONE"
   BACKBONE_NAME="${BACKBONE##*/}"
 else
-  BACKBONE_PATH="/root/autodl-tmp/model/${BACKBONE}"
+  BACKBONE_PATH="/data/home/lijiahui/DIV-TTRL/model/${BACKBONE}"
   BACKBONE_NAME="$BACKBONE"
 fi
 
@@ -238,7 +238,7 @@ EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 
 
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/data/home/lijiahui/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 
 
@@ -265,7 +265,7 @@ echo "==============================="
 
 # # ------------------------------------------------------------
 python -m verl.trainer.main_ppo \
-  reward_model.reward_manager=diversity_ttrl \
+  reward_model.reward_manager=ttrl \
   reward_model.reward_kwargs.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   reward_model.reward_kwargs.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
   reward_model.reward_kwargs.mode="train" \
@@ -317,19 +317,16 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
-  algorithm.diversity_density_fallback=grpo \
-  algorithm.diversity_density_k=2 \
-  algorithm.diversity_density_use_metric=consistency_rate \
-  algorithm.consistency_threshold=0.8 \
-  algorithm.lam_div=0.05 \
-  algorithm.c_max=2 \
-  algorithm.div_sc_threshold=0.3 \
+  algorithm.diversity_density_k=4 \
+  +algorithm.lam_div=0.05 \
+  +algorithm.c_max=2 \
+  +algorithm.div_sc_threshold=0.5 \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=8 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
-  trainer.save_freq=15 \
+  trainer.save_freq=60 \
   trainer.test_freq=5 \
   trainer.max_actor_ckpt_to_keep=0 \
   trainer.max_critic_ckpt_to_keep=0 \

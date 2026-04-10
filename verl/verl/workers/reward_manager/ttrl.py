@@ -338,9 +338,14 @@ class TTRLRewardManager:
                 unique_answers = len(set(final_answers))
                 diversity_ratio = unique_answers / len(group_pred_outputs) if len(group_pred_outputs) > 0 else 0.0
                 ttrl_metrics["diversity_ratio"] = diversity_ratio
+                ttrl_metrics["_answer_types"] = final_answers[:self.n_samples_per_prompt]
+                ttrl_metrics["_consistency_rate"] = [online_consistency_rate] * self.n_samples_per_prompt
 
                 for k, v in ttrl_metrics.items():
-                    all_ttrl_metrics[k].append(v)
+                    if k in ["_answer_types", "_consistency_rate"]:
+                        all_ttrl_metrics[k].extend(v)
+                    else:
+                        all_ttrl_metrics[k].append(v)
 
                 # === STAGE 3: Reward assignment with cached data (fixes variable scope bug) ===
                 for i in range(self.n_votes_per_prompt):
@@ -369,9 +374,13 @@ class TTRLRewardManager:
             
             for k, v in all_ttrl_metrics.items():
                 if isinstance(v, list):
-                    v = np.mean(v)
-                    print(f"[{k}]", v)
-                    ttrl_info[k] = v
+                    # Only compute mean for numeric values; non-numeric fields (like _answer_types) are passed through
+                    if k.startswith("_") or not all(isinstance(x, (int, float, np.number)) for x in v):
+                        ttrl_info[k] = np.array(v) if k.startswith("_") else v
+                    else:
+                        v_mean = np.mean(v)
+                        print(f"[{k}]", v_mean)
+                        ttrl_info[k] = v_mean
 
             return reward_tensor, reward_extra_info, ttrl_info
 
