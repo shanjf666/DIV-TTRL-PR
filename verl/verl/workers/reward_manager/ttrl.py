@@ -338,7 +338,21 @@ class TTRLRewardManager:
                 unique_answers = len(set(final_answers))
                 diversity_ratio = unique_answers / len(group_pred_outputs) if len(group_pred_outputs) > 0 else 0.0
                 ttrl_metrics["diversity_ratio"] = diversity_ratio
-                ttrl_metrics["_answer_types"] = final_answers[:self.n_samples_per_prompt]
+                
+                # Map answers to integers (0 = correct, other = incorrect) for ray_trainer GRPO consistency
+                answer_to_id = {ans: hash(ans) for ans in set(final_answers)}
+                group_answer_types = []
+                for i in range(self.n_samples_per_prompt):
+                    is_correct = rewards[i] > 0
+                    if is_correct:
+                        ans_type = 0
+                    else:
+                        ans_type = answer_to_id[final_answers[i]]
+                        if ans_type == 0:
+                            ans_type = 1
+                    group_answer_types.append(ans_type)
+                
+                ttrl_metrics["_answer_types"] = group_answer_types
                 ttrl_metrics["_consistency_rate"] = [online_consistency_rate] * self.n_samples_per_prompt
 
                 for k, v in ttrl_metrics.items():
