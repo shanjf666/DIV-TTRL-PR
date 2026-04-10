@@ -571,8 +571,24 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+
+            # Check if this is a verification pass (two-stage pipeline)
+            verification_mode = prompts.meta_info.get("verification_mode", None)
+            if verification_mode is not None:
+                # Verification pass: use shorter max_new_tokens and specific sampling params
+                verification_max_tokens = prompts.meta_info.get("verification_max_new_tokens", 512)
+                verification_kwargs = {"max_tokens": verification_max_tokens}
+
+                # For sampling mode verification, pass temperature
+                if verification_mode == "sampling":
+                    verification_temp = prompts.meta_info.get("verification_temperature", 0.6)
+                    verification_kwargs["temperature"] = verification_temp
+                    verification_kwargs["n"] = 1  # n is already handled in DataProto construction
+
+                with self.rollout.update_sampling_params(**verification_kwargs):
+                    output = self.rollout.generate_sequences(prompts=prompts)
             # check if meta_info contains "do_vote"
-            if "do_vote" in prompts.meta_info and prompts.meta_info["do_vote"]:
+            elif "do_vote" in prompts.meta_info and prompts.meta_info["do_vote"]:
                 output = self.rollout.generate_sequences(prompts, n=self.config.rollout.n_vote)
             else:
                 output = self.rollout.generate_sequences(prompts=prompts)

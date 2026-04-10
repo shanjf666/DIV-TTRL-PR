@@ -406,6 +406,19 @@ class RayPPOTrainer:
         else:
             self.use_ttrl = False
 
+        # Two-stage self-verification configuration
+        self.two_stage_verify = getattr(self.config, 'two_stage_verify', False)
+        if self.two_stage_verify:
+            self.two_stage_mode = getattr(self.config, 'two_stage_mode', 'greedy')  # 'greedy' or 'sampling'
+            self.two_stage_n = getattr(self.config, 'two_stage_n', 4)  # N for sampling mode
+            self.two_stage_max_candidates = getattr(self.config, 'two_stage_max_candidates', 10)
+            self.two_stage_max_new_tokens = getattr(self.config, 'two_stage_max_new_tokens', 512)
+            self.two_stage_fallback = getattr(self.config, 'two_stage_fallback', 'majority')  # 'majority' or 'penalize'
+            self.two_stage_micro_batch_size = getattr(self.config, 'two_stage_micro_batch_size', 0)  # 0 = auto
+            print(f"[TwoStage] Enabled: mode={self.two_stage_mode}, n={self.two_stage_n}, "
+                  f"max_candidates={self.two_stage_max_candidates}, max_new_tokens={self.two_stage_max_new_tokens}, "
+                  f"fallback={self.two_stage_fallback}")
+
         self._validate_config()
         self._create_dataloader()
 
@@ -979,6 +992,169 @@ class RayPPOTrainer:
 
         return data[selected_indices]
 
+    def _run_two_stage_verification(self, batch: DataProto, metrics: dict) -> list:
+        """Run two-stage self-verification on the current batch.
+
+        This method:
+        1. Extracts candidate answers from the Pass 1 rollout data
+        2. Constructs verification prompts for each candidate
+        3. Runs micro-batched verification inference via generate_sequences
+        4. Parses verification results and resolves pseudo-labels
+
+        Args:
+            batch: The DataProto containing Pass 1 rollout data (already repeated & union'd).
+            metrics: Dict to log verification metrics into.
+
+        Returns:
+            List of pseudo-labels, one per prompt group (or None for penalize fallback).
+        """
+        import gc
+        from verl.utils.reward_score.ttrl.two_stage_utils import (
+            extract_candidate_answers,
+            construct_verification_dataproto,
+            decode_verification_outputs,
+            resolve_pseudo_labels,
+        )
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+
+        # Determine the task type from the first sample
+        first_item = batch[0]
+        data_source = first_item.non_tensor_batch.get("data_source", "math")
+        ds = str(data_source).lower()
+        if any(k in ds for k in ["gpqa"]):
+            task = "gpqa"
+        else:
+            task = "math"
+
+        print(f"[TwoStage] Starting verification: task={task}, mode={self.two_stage_mode}")
+
+        # Step 1: Extract candidate answers from Pass 1
+        prompt_groups = extract_candidate_answers(
+            pass1_data=batch,
+            tokenizer=self.tokenizer,
+            n_votes_per_prompt=self.n_votes_per_prompt,
+            task=task,
+            max_candidates=self.two_stage_max_candidates,
+        )
+
+        total_candidates = sum(len(g["candidates"]) for g in prompt_groups)
+        print(f"[TwoStage] Extracted {total_candidates} candidates from {len(prompt_groups)} prompt groups")
+        metrics["train/two_stage_total_candidates"] = total_candidates
+
+        if total_candidates == 0:
+            print("[TwoStage] No candidates to verify. Skipping.")
+            return [None] * len(prompt_groups)
+
+        # Step 2: Construct verification DataProto
+        verification_batch, verification_mapping = construct_verification_dataproto(
+            prompt_groups=prompt_groups,
+            tokenizer=self.tokenizer,
+            verification_mode=self.two_stage_mode,
+            verification_n=self.two_stage_n if self.two_stage_mode == "sampling" else 1,
+            max_prompt_length=self.config.data.max_prompt_length * 2,  # verification prompts are longer
+        )
+
+        if verification_batch is None or len(verification_batch) == 0:
+            print("[TwoStage] Empty verification batch. Skipping.")
+            return [None] * len(prompt_groups)
+
+        print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
+
+        # Step 3: Set generation config for verification
+        verification_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
+        verification_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
+        verification_batch.meta_info["recompute_log_prob"] = False
+
+        # For greedy: do_sample=False triggers temperature=0 in vllm_rollout
+        # For sampling: do_sample=True with custom temperature
+        if self.two_stage_mode == "greedy":
+            verification_batch.meta_info["do_sample"] = False
+        else:
+            verification_batch.meta_info["do_sample"] = True
+            # Temperature will be passed through for sampling mode
+            verification_batch.meta_info["verification_temperature"] = 0.6
+
+        # Mark as verification pass (not training vote)
+        verification_batch.meta_info["do_vote"] = False
+        verification_batch.meta_info["verification_mode"] = self.two_stage_mode
+        verification_batch.meta_info["verification_max_new_tokens"] = self.two_stage_max_new_tokens
+
+        # Free VRAM before verification generation
+        torch.cuda.empty_cache()
+
+        # Step 4: Micro-batched verification generation
+        # Determine micro-batch size
+        if self.two_stage_micro_batch_size > 0:
+            micro_bs = self.two_stage_micro_batch_size
+        else:
+            # Auto: use ~1/4 of the original train batch size, min 4
+            micro_bs = max(4, self.config.data.train_batch_size // 4)
+
+        total_verification_size = len(verification_batch)
+        all_verification_outputs = []
+
+        print(f"[TwoStage] Running verification inference: {total_verification_size} samples, "
+              f"micro_batch_size={micro_bs}")
+
+        for chunk_start in range(0, total_verification_size, micro_bs):
+            chunk_end = min(chunk_start + micro_bs, total_verification_size)
+            chunk = verification_batch[chunk_start:chunk_end]
+
+            # Pad to be divisible by dp_size
+            chunk_padded, pad_size = pad_dataproto_to_divisor(chunk, self.actor_rollout_wg.world_size)
+
+            try:
+                chunk_output_padded = self.actor_rollout_wg.generate_sequences(chunk_padded)
+                chunk_output = unpad_dataproto(chunk_output_padded, pad_size=pad_size)
+
+                # Decode verification responses
+                chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
+                all_verification_outputs.extend(chunk_decoded)
+            except Exception as e:
+                print(f"[TwoStage] Error during verification chunk {chunk_start}-{chunk_end}: {e}")
+                # Fill with empty strings for this chunk
+                all_verification_outputs.extend([""] * (chunk_end - chunk_start))
+            finally:
+                # Cleanup per chunk
+                if 'chunk_output_padded' in locals():
+                    del chunk_output_padded
+                if 'chunk_output' in locals():
+                    del chunk_output
+                if 'chunk_padded' in locals():
+                    del chunk_padded
+                gc.collect()
+                torch.cuda.empty_cache()
+
+        print(f"[TwoStage] Decoded {len(all_verification_outputs)} verification outputs")
+
+        # Step 5: Resolve pseudo-labels
+        pseudo_labels = resolve_pseudo_labels(
+            verification_outputs=all_verification_outputs,
+            verification_mapping=verification_mapping,
+            num_prompt_groups=len(prompt_groups),
+            mode=self.two_stage_mode,
+            fallback_strategy=self.two_stage_fallback,
+        )
+
+        # Log verification-specific metrics
+        from verl.utils.reward_score.ttrl.two_stage_utils import parse_verification_result
+        true_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is True)
+        false_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is False)
+        none_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is None)
+
+        metrics["train/two_stage_true_rate"] = true_count / max(1, len(all_verification_outputs))
+        metrics["train/two_stage_false_rate"] = false_count / max(1, len(all_verification_outputs))
+        metrics["train/two_stage_parse_fail_rate"] = none_count / max(1, len(all_verification_outputs))
+
+        print(f"[TwoStage] Results: True={true_count}, False={false_count}, ParseFail={none_count}")
+
+        # Cleanup
+        del verification_batch, all_verification_outputs, verification_mapping
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return pseudo_labels
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1075,6 +1251,31 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
+
+                    # ================================================================
+                    # Pass 2: Two-Stage Self-Verification
+                    # ================================================================
+                    if self.use_ttrl and self.two_stage_verify:
+                        with _timer("two_stage_verify", timing_raw):
+                            verified_pseudo_labels = self._run_two_stage_verification(
+                                batch=batch,
+                                metrics=metrics,
+                            )
+                            # Inject pseudo-labels into batch for TTRLRewardManager
+                            # verified_pseudo_labels is a list of length num_prompts
+                            # We need to expand it to match the batch size (n_votes_per_prompt per prompt)
+                            if verified_pseudo_labels is not None:
+                                expanded_labels = []
+                                for label in verified_pseudo_labels:
+                                    expanded_labels.extend([label] * self.n_votes_per_prompt)
+                                batch.non_tensor_batch["verified_pseudo_label"] = np.array(
+                                    expanded_labels, dtype=object
+                                )
+                                # Log verification stats
+                                n_verified = sum(1 for l in verified_pseudo_labels if l is not None)
+                                n_total = len(verified_pseudo_labels)
+                                metrics["train/two_stage_verified_ratio"] = n_verified / n_total if n_total > 0 else 0.0
+                                print(f"[TwoStage] Verified {n_verified}/{n_total} prompt groups")
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.

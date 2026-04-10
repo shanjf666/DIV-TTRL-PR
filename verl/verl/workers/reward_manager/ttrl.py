@@ -287,7 +287,21 @@ class TTRLRewardManager:
                 online_voted_answer, majority_count = online_counter.most_common(1)[0] if online_counter else (None, 0)
                 online_consistency_rate = majority_count / self.n_votes_per_prompt if self.n_votes_per_prompt > 0 else 0.0
 
-                # 2. Extract offline pseudo-label (priority: direct lookup from JSONL)
+                # 2. Check for two-stage verified pseudo-label (highest priority)
+                # This is injected by ray_trainer._run_two_stage_verification()
+                two_stage_label = None
+                two_stage_penalize = False
+                first_sample_idx = prompt_i * self.n_votes_per_prompt
+                if "verified_pseudo_label" in data[first_sample_idx].non_tensor_batch:
+                    two_stage_raw = data[first_sample_idx].non_tensor_batch["verified_pseudo_label"]
+                    if two_stage_raw is not None and str(two_stage_raw) != "None":
+                        two_stage_label = str(two_stage_raw)
+                    elif two_stage_raw is None:
+                        # None means the "penalize" fallback was triggered
+                        # (all candidate answers verified as False)
+                        two_stage_penalize = True
+
+                # 3. Extract offline pseudo-label (priority: direct lookup from JSONL)
                 offline_voted_answer = self.offline_pseudo_labels.get(prompt_str.strip())
 
                 # Fallback to metadata check if lookup failed
@@ -298,32 +312,58 @@ class TTRLRewardManager:
                             offline_voted_answer = candidate
                             break
 
-                # 3. Hybrid logic: If online consistency is low, fallback to offline label
+                # 4. Determine the label to use (priority: two-stage > hybrid offline > online majority)
                 verified_label = None
                 off_policy = 0.0
-                if getattr(self, "enable_hybrid", False) and online_consistency_rate < 0.3:       
+                label_source = "online_majority"
+
+                if two_stage_label is not None:
+                    # Two-stage verification succeeded
+                    verified_label = two_stage_label
+                    label_source = "two_stage_verified"
+                elif two_stage_penalize:
+                    # Two-stage verification says all candidates are wrong → penalize all
+                    # We set verified_label to a deliberately unmatchable string
+                    # so all rewards become 0, and we flag for -1 advantage later
+                    verified_label = "__TWO_STAGE_PENALIZE_ALL__"
+                    label_source = "two_stage_penalize"
+                elif getattr(self, "enable_hybrid", False) and online_consistency_rate < 0.3:
                     if offline_voted_answer:
                         verified_label = offline_voted_answer
                         off_policy = 1.0
+                        label_source = "offline_hybrid"
                     else:
                         if getattr(self, "pseudo_label_file", None):
                             print(f"Warning: Online SC {online_consistency_rate:.2f} < 0.3 but no label found for prompt in {self.pseudo_label_file}")
 
-                # 4. Compute reward using chosen label
+                # 5. Compute reward using chosen label
                 rewards, ttrl_metrics = test_time_train_metrics(group_pred_outputs, group_labels, task=task, extra_info=group_extra_info, verified_label=verified_label)
                 ttrl_metrics["off_policy_ratio"] = off_policy
+                # Track label source as numeric flags for safe aggregation
+                ttrl_metrics["label_source_two_stage"] = 1.0 if label_source == "two_stage_verified" else 0.0
+                ttrl_metrics["label_source_penalize"] = 1.0 if label_source == "two_stage_penalize" else 0.0
+                ttrl_metrics["label_source_offline"] = 1.0 if label_source == "offline_hybrid" else 0.0
 
-                # Compute FP/FN rates
+                # If penalize mode triggered, override all rewards to -1
+                if two_stage_penalize:
+                    rewards = [-1.0] * len(rewards)
+                    ttrl_metrics["two_stage_penalized"] = 1.0
+                else:
+                    ttrl_metrics["two_stage_penalized"] = 0.0
+
+                # Compute FP/FN rates (skip if penalize mode set all rewards to -1)
                 ground_truth = group_labels[0]
                 true_rewards, _ = auto_verify(
                     task, group_pred_outputs, [ground_truth] * len(group_pred_outputs),
                     extra_info=group_extra_info
                 )
-                n_pseudo_pos = sum(1 for r in rewards if r > 0)
-                n_false_pos = sum(1 for r, t in zip(rewards, true_rewards) if r > 0 and t == 0)
+                # For FP/FN, treat -1 rewards as negative (not a true positive)
+                effective_rewards = [max(0, r) for r in rewards]
+                n_pseudo_pos = sum(1 for r in effective_rewards if r > 0)
+                n_false_pos = sum(1 for r, t in zip(effective_rewards, true_rewards) if r > 0 and t == 0)
                 fp_rate = n_false_pos / n_pseudo_pos if n_pseudo_pos > 0 else 0.0
-                n_pseudo_neg = sum(1 for r in rewards if r == 0)
-                n_false_neg = sum(1 for r, t in zip(rewards, true_rewards) if r == 0 and t > 0)
+                n_pseudo_neg = sum(1 for r in effective_rewards if r == 0)
+                n_false_neg = sum(1 for r, t in zip(effective_rewards, true_rewards) if r == 0 and t > 0)
                 fn_rate = n_false_neg / n_pseudo_neg if n_pseudo_neg > 0 else 0.0
                 ttrl_metrics["false_positive_rate"] = fp_rate
                 ttrl_metrics["false_negative_rate"] = fn_rate

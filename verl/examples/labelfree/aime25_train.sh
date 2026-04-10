@@ -266,7 +266,15 @@ python -m verl.trainer.main_ppo \
   trainer.max_actor_ckpt_to_keep=0 \
   trainer.max_critic_ckpt_to_keep=0 \
   trainer.default_local_dir=$OUTPUT_DIR \
-  trainer.total_epochs=$EPISODE "$@"
+  trainer.total_epochs=$EPISODE \
+  +two_stage_verify=False \
+  +two_stage_mode=greedy \
+  +two_stage_n=4 \
+  +two_stage_max_candidates=10 \
+  +two_stage_max_new_tokens=512 \
+  +two_stage_fallback=majority \
+  +two_stage_micro_batch_size=0 \
+  "$@"
 
 echo "=== Training Completed ==="
 echo "Output directory: $OUTPUT_DIR"
