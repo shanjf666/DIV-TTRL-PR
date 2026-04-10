@@ -317,7 +317,7 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
-  algorithm.diversity_density_k=4 \
+  algorithm.k=4 \
   +algorithm.lam_div=0.05 \
   +algorithm.c_max=2 \
   +algorithm.div_sc_threshold=0.5 \

@@ -272,7 +272,7 @@ def compute_advantage(
         if diversity_density_config is None:
             diversity_density_config = {}
             
-        k = diversity_density_config.get("k", 8)
+        k = diversity_density_config.get("k", 4)
         
         # Need answer_types from non_tensor_batch
         if "answer_types" not in data.non_tensor_batch:
@@ -1196,7 +1196,7 @@ class RayPPOTrainer:
                         # compute advantages, executed on the driver process
                         # Prepare configuration for advantage estimators
                         diversity_density_config = {
-                            "k": getattr(self.config.algorithm, "diversity_density_k", 8),
+                            "k": getattr(self.config.algorithm, "k", 4),
                             "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
                             "c_max": getattr(self.config.algorithm, "c_max", 2.0),
                             "div_sc_threshold": getattr(self.config.algorithm, "div_sc_threshold", 0.3),

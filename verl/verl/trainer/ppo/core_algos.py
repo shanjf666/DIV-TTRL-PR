@@ -355,10 +355,11 @@ def compute_pass_grpo_penalized_advantage(
     device = token_level_rewards.device
     dtype = token_level_rewards.dtype
     
-    lam_div = diversity_density_config.get("lam_div", 0.05)
+    lam_div = diversity_density_config.get("lam_div", 0.2)
     c_max = diversity_density_config.get("c_max", 2.0)
     div_sc_threshold = diversity_density_config.get("div_sc_threshold", 0.3)
-    
+    length_max = diversity_density_config.get("length_max", 4096)
+    mode = diversity_density_config.get("mode", "dynamic")
     with torch.no_grad():
         prompt_to_samples = defaultdict(list)
         prompt_to_answers = defaultdict(list)
@@ -423,21 +424,21 @@ def compute_pass_grpo_penalized_advantage(
                 var_l = sum((x - mu_l)**2 for x in correct_lengths) / len(correct_lengths)
                 sigma_l = np.sqrt(var_l)
                 
-                max_l_group = max(int(actual_lengths_cpu[idx]) for idx in sample_indices)
-                
+                if mode == "dynamic":
+                    current_lam_div = (a_pos) / (c_max + 1e-10) if a_pos > 0 else lam_div
+                elif mode == "static":
+                    current_lam_div = lam_div
                 for local_i, global_i in enumerate(sample_indices):
-                    reward_div = 0.0
                     if answers[local_i] == 0:
                         l_i = int(actual_lengths_cpu[global_i])
-                        div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
-                        reward_div = lam_div * min(div_val, c_max)
-                        
-                        if l_i <= 0.8 * max_l_group:
+                        if l_i < 0.85 * length_max:
+                            div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
+                            reward_div = current_lam_div * min(div_val, c_max)
                             group_r_div[local_i] = reward_div
-                            
-                    if reward_div > 0:
-                        total_r_div += reward_div
-                        r_div_count += 1
+                        
+                            if reward_div > 0:
+                                total_r_div += reward_div
+                                r_div_count += 1
     
             for local_i, global_i in enumerate(sample_indices):
                 a_pass_k = a_pos if answers[local_i] == 0 else a_neg
@@ -449,6 +450,7 @@ def compute_pass_grpo_penalized_advantage(
                 total_a_passk += a_pass_k
                 total_adv_raw += raw_v
                 
+               
             # Conditional Normalization: Only re-normalize if rewards were added
             # If not added, raw_v is the raw Pass@k advantage which is already theoretically normalized
             if N > 1 and sc_ratio > div_sc_threshold:
@@ -466,6 +468,8 @@ def compute_pass_grpo_penalized_advantage(
             "pass_grpo_penalized/r_div_triggered_ratio": r_div_count / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/avg_raw_a_passk": total_a_passk / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/avg_adv_raw": total_adv_raw / bs if bs > 0 else 0.0,
+            "pass_grpo_penalized/lam_div": lam_div,
+            "pass_grpo_penalized/div_sc_threshold": div_sc_threshold,
         }
     
         # Create GPU tensors only once at the end
