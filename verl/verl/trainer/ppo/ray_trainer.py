@@ -1013,7 +1013,7 @@ class RayPPOTrainer:
             extract_candidate_answers,
             construct_verification_dataproto,
             decode_verification_outputs,
-            resolve_pseudo_labels,
+            resolve_filtered_pseudo_labels,
         )
         from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -1034,20 +1034,29 @@ class RayPPOTrainer:
             tokenizer=self.tokenizer,
             n_votes_per_prompt=self.n_votes_per_prompt,
             task=task,
-            max_candidates=self.two_stage_max_candidates,
+            max_candidates=5,
         )
 
-        total_candidates = sum(len(g["candidates"]) for g in prompt_groups)
-        print(f"[TwoStage] Extracted {total_candidates} candidates from {len(prompt_groups)} prompt groups")
-        metrics["train/two_stage_total_candidates"] = total_candidates
+        groups_to_verify = []
+        for g in prompt_groups:
+            if g.get("majority_rate", 1.0) < 0.3:
+                groups_to_verify.append(g)
 
-        if total_candidates == 0:
-            print("[TwoStage] No candidates to verify. Skipping.")
-            return [None] * len(prompt_groups)
+        metrics["train/two_stage_trigger_rate"] = len(groups_to_verify) / len(prompt_groups) if prompt_groups else 0.0
+        avg_majority_rate = sum(g.get("majority_rate", 0.0) for g in prompt_groups) / len(prompt_groups) if prompt_groups else 0.0
+        metrics["train/two_stage_majority_rate_mean"] = avg_majority_rate
+
+        if not groups_to_verify:
+            print("[TwoStage] All prompt groups skipped verification due to majority >= 0.3")
+            return [g.get("majority_answer") for g in prompt_groups]
+
+        total_candidates = sum(len(g["candidates"]) for g in groups_to_verify)
+        print(f"[TwoStage] Triggered verification for {len(groups_to_verify)}/{len(prompt_groups)} prompt groups")
+        metrics["train/two_stage_total_candidates"] = total_candidates
 
         # Step 2: Construct verification DataProto
         verification_batch, verification_mapping = construct_verification_dataproto(
-            prompt_groups=prompt_groups,
+            prompt_groups=groups_to_verify,
             tokenizer=self.tokenizer,
             verification_mode=self.two_stage_mode,
             verification_n=self.two_stage_n if self.two_stage_mode == "sampling" else 1,
@@ -1056,7 +1065,7 @@ class RayPPOTrainer:
 
         if verification_batch is None or len(verification_batch) == 0:
             print("[TwoStage] Empty verification batch. Skipping.")
-            return [None] * len(prompt_groups)
+            return [g.get("majority_answer") for g in prompt_groups]
 
         print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
 
@@ -1128,16 +1137,34 @@ class RayPPOTrainer:
         print(f"[TwoStage] Decoded {len(all_verification_outputs)} verification outputs")
 
         # Step 5: Resolve pseudo-labels
-        pseudo_labels = resolve_pseudo_labels(
+        verified_labels = resolve_filtered_pseudo_labels(
             verification_outputs=all_verification_outputs,
             verification_mapping=verification_mapping,
-            num_prompt_groups=len(prompt_groups),
-            mode=self.two_stage_mode,
-            fallback_strategy=self.two_stage_fallback,
+            prompt_groups=groups_to_verify,
         )
 
-        # Log verification-specific metrics
         from verl.utils.reward_score.ttrl.two_stage_utils import parse_verification_result
+        
+        # Merge back with skipped groups
+        final_pseudo_labels = []
+        verified_idx = 0
+        success_filter_count = 0
+        for g in prompt_groups:
+            if g.get("majority_rate", 1.0) < 0.3:
+                resolved_label = verified_labels[verified_idx]
+                final_pseudo_labels.append(resolved_label)
+                if resolved_label != g.get("majority_answer"):
+                     success_filter_count += 1
+                verified_idx += 1
+            else:
+                final_pseudo_labels.append(g.get("majority_answer"))
+
+        if len(groups_to_verify) > 0:
+            metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
+        else:
+            metrics["train/two_stage_filtered_ratio"] = 0.0
+
+        # Log verification-specific metrics
         true_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is True)
         false_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is False)
         none_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is None)
@@ -1147,13 +1174,14 @@ class RayPPOTrainer:
         metrics["train/two_stage_parse_fail_rate"] = none_count / max(1, len(all_verification_outputs))
 
         print(f"[TwoStage] Results: True={true_count}, False={false_count}, ParseFail={none_count}")
+        print(f"[TwoStage] Successfully filtered to new candidate in {success_filter_count}/{len(groups_to_verify)} triggered groups")
 
         # Cleanup
         del verification_batch, all_verification_outputs, verification_mapping
         gc.collect()
         torch.cuda.empty_cache()
 
-        return pseudo_labels
+        return final_pseudo_labels
 
     def fit(self):
         """

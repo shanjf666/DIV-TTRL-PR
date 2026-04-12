@@ -45,10 +45,9 @@ logger = logging.getLogger(__name__)
 # Verification Prompt Templates
 # ===========================================================================
 
-VERIFICATION_SYSTEM_PROMPT = "You are a rigorous mathematical reviewer."
+VERIFICATION_SYSTEM_PROMPT = """You are a rigorous mathematical reviewer."""
 
-VERIFICATION_USER_TEMPLATE = """\
-Problem:
+VERIFICATION_USER_TEMPLATE = """Problem:
 {problem}
 
 [Hypothesis to Test]
@@ -56,19 +55,14 @@ A previous attempt at this problem resulted in the following answer:
 {candidate_answer}
 
 [Task]
-Act as a rigorous mathematical reviewer.
-1. Reverse Verification Stage: Treat the answer ({candidate_answer}) as a given hypothesis. Plug this answer BACK into the original problem conditions. Perform a rigorous backward-substitution to check if it satisfies all constraints or if it leads to a mathematical contradiction. You MUST conclude this stage by explicitly stating either "Verification Result: True" (if the hypothesis perfectly satisfies all conditions) or "Verification Result: False" (if it leads to any contradiction).
-2. Solution Stage: Based on the insights gained from your reverse verification, provide your assessment.
+Act as a rigorous mathematical reviewer. 
+Treat the previous answer ({candidate_answer}) as a given hypothesis. Plug this answer BACK into the original problem conditions. Perform a rigorous backward-substitution to check if it satisfies all constraints or if it leads to a mathematical contradiction. 
 
 You MUST strictly use the following XML format for your response:
 <reverse_verification>
 (Your step-by-step backward substitution checking if {candidate_answer} contradicts the problem conditions)
 Verification Result: [True/False]
-</reverse_verification>
-<assessment>
-(Your brief assessment of whether the answer is correct)
-Therefore, the final answer is \\boxed{{...}}
-</assessment>"""
+</reverse_verification>"""
 
 
 # ===========================================================================
@@ -153,6 +147,8 @@ def extract_candidate_answers(
             "candidates": candidates,  # List[(answer, count)]
             "all_answers": model_answers,
             "prompt_group_idx": prompt_i,
+            "majority_rate": candidates[0][1] / n_votes_per_prompt if candidates else 0.0,
+            "majority_answer": candidates[0][0] if candidates else None,
         })
 
     return prompt_groups
@@ -229,12 +225,13 @@ def construct_verification_dataproto(
                 prompt_text = tokenizer.apply_chat_template(
                     messages, tokenize=False, add_generation_prompt=True
                 )
+                prompt_text += "<reverse_verification>\n"
             except Exception:
                 # Fallback: manual ChatML formatting
                 prompt_text = (
                     f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
                     f"<|im_start|>user\n{user_content}<|im_end|>\n"
-                    f"<|im_start|>assistant\n"
+                    f"<|im_start|>assistant\n<reverse_verification>\n"
                 )
 
             # Tokenize
@@ -334,83 +331,43 @@ def construct_verification_dataproto(
 def parse_verification_result(text: str) -> Optional[bool]:
     """Extract 'Verification Result: True/False' from the verifier's output.
 
-    Handles various formats:
-        - "Verification Result: True"
-        - "Verification Result: False"
-        - Within <reverse_verification> XML tags
-        - Case-insensitive matching
-
-    Args:
-        text: The decoded verification response text.
-
-    Returns:
-        True if verified correct, False if verified incorrect, None if parsing fails.
+    Uses robust keyword matching syntax since we compel standard formatting.
     """
     if not text:
         return None
 
-    # Try to find within <reverse_verification> tags first
-    rv_match = re.search(
-        r"<reverse_verification>(.*?)</reverse_verification>",
-        text,
-        re.DOTALL | re.IGNORECASE,
-    )
-    search_text = rv_match.group(1) if rv_match else text
-
-    # Look for the verification result
-    match = re.search(
-        r"Verification\s+Result\s*:\s*(True|False)",
-        search_text,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1).strip().lower() == "true"
-
-    # Fallback: look for standalone True/False near end of text
-    # This handles cases where the model doesn't follow the exact format
-    last_200 = search_text[-200:] if len(search_text) > 200 else search_text
-    fallback_match = re.search(
-        r"\b(True|False)\b",
-        last_200,
-        re.IGNORECASE,
-    )
-    if fallback_match:
-        return fallback_match.group(1).strip().lower() == "true"
-
+    lower_text = text.lower()
+    if "verification result: true" in lower_text or "verification result:true" in lower_text:
+        return True
+    elif "verification result: false" in lower_text or "verification result:false" in lower_text:
+        return False
+        
     return None
 
-
-# ===========================================================================
-# Resolve Pseudo Labels
-# ===========================================================================
-
-def resolve_pseudo_labels(
+def resolve_filtered_pseudo_labels(
     verification_outputs: List[str],
     verification_mapping: List[Dict],
-    num_prompt_groups: int,
-    mode: str = "greedy",
-    fallback_strategy: str = "majority",
+    prompt_groups: List[Dict],
 ) -> List[Optional[str]]:
     """Match verification results back to prompt groups and resolve the best pseudo-label.
+    
+    Filters candidates based on majority vote (True_votes > False_votes).
+    If no candidate passes, falls back to the original majority answer from Pass 1.
 
     Args:
         verification_outputs: List of decoded verification response strings.
         verification_mapping: The mapping list from construct_verification_dataproto().
-        num_prompt_groups: Total number of original prompt groups.
-        mode: "greedy" or "sampling".
-        fallback_strategy: What to do when all candidates verify as False:
-            - "majority": return the highest-frequency candidate anyway
-            - "penalize": return None (signals trainer to apply -1 advantage)
+        prompt_groups: Output of extract_candidate_answers(), contains fallback info.
 
     Returns:
-        List of length num_prompt_groups. Each element is either:
-            - str: the verified pseudo-label answer
-            - None: no valid pseudo-label (for "penalize" fallback)
+        List of length len(prompt_groups), each containing the selected pseudo-label answer.
     """
     assert len(verification_outputs) == len(verification_mapping), (
         f"Mismatch: {len(verification_outputs)} outputs vs {len(verification_mapping)} mappings"
     )
 
+    num_prompt_groups = len(prompt_groups)
+    
     # Group results by prompt_group_idx
     group_results: Dict[int, List[Dict]] = {i: [] for i in range(num_prompt_groups)}
 
@@ -424,102 +381,44 @@ def resolve_pseudo_labels(
             "is_true": is_true,
         })
 
-    # Resolve per prompt group
     pseudo_labels = [None] * num_prompt_groups
 
     for group_idx in range(num_prompt_groups):
         results = group_results[group_idx]
+        original_majority_ans = prompt_groups[group_idx].get("majority_answer")
+        
         if not results:
-            # No verification was run for this group (e.g., no valid candidates)
-            pseudo_labels[group_idx] = None
+            pseudo_labels[group_idx] = original_majority_ans
             continue
-
-        if mode == "greedy":
-            pseudo_labels[group_idx] = _resolve_greedy(results, fallback_strategy)
-        elif mode == "sampling":
-            pseudo_labels[group_idx] = _resolve_sampling(results, fallback_strategy)
+            
+        candidate_scores: Dict[str, Dict] = {}
+        for r in results:
+            ans = r["candidate_answer"]
+            if ans not in candidate_scores:
+                candidate_scores[ans] = {
+                    "frequency": r["frequency"],
+                    "true_count": 0,
+                    "false_count": 0
+                }
+            if r["is_true"] is True:
+                candidate_scores[ans]["true_count"] += 1
+            elif r["is_true"] is False:
+                candidate_scores[ans]["false_count"] += 1
+                
+        valid_candidates = []
+        for ans, info in candidate_scores.items():
+            if info["true_count"] > info["false_count"]:
+                valid_candidates.append((ans, info["frequency"]))
+                
+        if valid_candidates:
+            # Pick the one with highest original frequency from Pass 1 among valid
+            valid_candidates.sort(key=lambda x: x[1], reverse=True)
+            pseudo_labels[group_idx] = valid_candidates[0][0]
         else:
-            raise ValueError(f"Unknown verification mode: {mode}")
+            # Fallback: direct majority from Pass 1
+            pseudo_labels[group_idx] = original_majority_ans
 
     return pseudo_labels
-
-
-def _resolve_greedy(results: List[Dict], fallback_strategy: str) -> Optional[str]:
-    """Greedy resolution: each candidate has 1 verification result.
-
-    Selection logic:
-    1. Among candidates where is_true == True, pick the one with highest frequency.
-    2. If no candidate is True:
-       - "majority" fallback: pick the highest-frequency candidate
-       - "penalize" fallback: return None
-    """
-    true_candidates = [r for r in results if r["is_true"] is True]
-
-    if true_candidates:
-        # Sort by frequency descending, pick the best
-        true_candidates.sort(key=lambda x: x["frequency"], reverse=True)
-        return true_candidates[0]["candidate_answer"]
-    else:
-        if fallback_strategy == "majority":
-            # Fallback to highest frequency
-            results.sort(key=lambda x: x["frequency"], reverse=True)
-            return results[0]["candidate_answer"]
-        elif fallback_strategy == "penalize":
-            return None
-        else:
-            raise ValueError(f"Unknown fallback_strategy: {fallback_strategy}")
-
-
-def _resolve_sampling(results: List[Dict], fallback_strategy: str) -> Optional[str]:
-    """Sampling resolution: each candidate has N verification results.
-
-    Selection logic:
-    1. For each candidate, count how many times is_true == True.
-    2. Compute a score: true_count * frequency (weighted vote).
-    3. Pick the candidate with the highest score (must have true_count > 0).
-    4. Fallback if no candidate has any True vote.
-    """
-    # Group by candidate answer
-    candidate_scores: Dict[str, Dict] = {}
-
-    for r in results:
-        ans = r["candidate_answer"]
-        if ans not in candidate_scores:
-            candidate_scores[ans] = {
-                "frequency": r["frequency"],
-                "true_count": 0,
-                "total_count": 0,
-            }
-        if r["is_true"] is True:
-            candidate_scores[ans]["true_count"] += 1
-        candidate_scores[ans]["total_count"] += 1
-
-    # Find candidates with at least one True verification
-    valid_candidates = [
-        (ans, info) for ans, info in candidate_scores.items()
-        if info["true_count"] > 0
-    ]
-
-    if valid_candidates:
-        # Score = true_count * frequency. Higher is better.
-        valid_candidates.sort(
-            key=lambda x: x[1]["true_count"] * x[1]["frequency"],
-            reverse=True,
-        )
-        return valid_candidates[0][0]
-    else:
-        if fallback_strategy == "majority":
-            # Pick highest frequency
-            all_candidates = sorted(
-                candidate_scores.items(),
-                key=lambda x: x[1]["frequency"],
-                reverse=True,
-            )
-            return all_candidates[0][0] if all_candidates else None
-        elif fallback_strategy == "penalize":
-            return None
-        else:
-            raise ValueError(f"Unknown fallback_strategy: {fallback_strategy}")
 
 
 # ===========================================================================
