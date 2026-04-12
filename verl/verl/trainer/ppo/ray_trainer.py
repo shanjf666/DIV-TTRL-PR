@@ -1368,6 +1368,12 @@ class RayPPOTrainer:
                                     if not k.startswith("_"):  # Skip per-sample arrays
                                         metrics.update({f"train/{k}": v})
                                 
+                                # Log accuracy comparison to terminal
+                                if "label_accuracy_majority" in ttrl_metrics and "label_accuracy_two_stage" in ttrl_metrics:
+                                    maj_acc = ttrl_metrics["label_accuracy_majority"]
+                                    ts_acc = ttrl_metrics["label_accuracy_two_stage"]
+                                    print(f"[TwoStage] Accuracy Comparison: Majority={maj_acc:.4f}, Two-Stage={ts_acc:.4f}")
+                                
                                 # Down Sampling
                                 batch = self._select_top_k_per_prompt(batch, self.n_votes_per_prompt, self.n_samples_per_prompt)
                                 self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt

@@ -338,6 +338,13 @@ class TTRLRewardManager:
 
                 # 5. Compute reward using chosen label
                 rewards, ttrl_metrics = test_time_train_metrics(group_pred_outputs, group_labels, task=task, extra_info=group_extra_info, verified_label=verified_label)
+                
+                # Accuracy comparison metrics
+                ground_truth = group_labels[0]
+                is_maj_correct, _ = auto_verify(task, [online_voted_answer], [ground_truth], extra_info=[group_extra_info[0]])
+                ttrl_metrics["label_accuracy_majority"] = float(is_maj_correct[0])
+                ttrl_metrics["label_accuracy_two_stage"] = ttrl_metrics["label_accuracy"] # label_accuracy in ttt_metrics already uses verified_label if provided
+
                 ttrl_metrics["off_policy_ratio"] = off_policy
                 # Track label source as numeric flags for safe aggregation
                 ttrl_metrics["label_source_two_stage"] = 1.0 if label_source == "two_stage_verified" else 0.0
