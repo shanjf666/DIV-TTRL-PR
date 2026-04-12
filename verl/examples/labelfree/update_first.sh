@@ -1,6 +1,6 @@
 #!/bin/bash
 """
-bash examples/labelfree/math1.sh --backbone /root/autodl-tmp/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base --clip-high --ent 0.003
+bash examples/labelfree/update_first.sh --backbone /root/autodl-tmp/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base --clip-high --ent 0.003
 python /root/autodl-tmp/DIV-TTRL/verl/scripts/model_merger.py \
     --backend fsdp \
     --local_dir /root/autodl-tmp/model/TTRL-MATH500/MATH-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/220024/global_step_45/actor \
@@ -166,7 +166,7 @@ else
 fi
 
 # Set EPISODE
-EPISODE=5
+EPISODE=4
 DATA_TRAIN_BATCH_SIZE=16
 N_VOTES_PER_PROMPT=32 # Reduce candidates to balance computational overhead
 N_SAMPLES_PER_PROMPT=32 # Keep training sample count
@@ -180,7 +180,7 @@ if [[ "$BACKBONE" == *"/"* ]]; then
   BACKBONE_PATH="$BACKBONE"
   BACKBONE_NAME="${BACKBONE##*/}"
 else
-  BACKBONE_PATH="/data/home/lijiahui/DIV-TTRL/model/${BACKBONE}"
+  BACKBONE_PATH="/root/autodl-tmp/model/${BACKBONE}"
   BACKBONE_NAME="$BACKBONE"
 fi
 
@@ -238,7 +238,7 @@ EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 
 
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/data/home/lijiahui/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 
 
@@ -265,7 +265,6 @@ echo "==============================="
 
 # # ------------------------------------------------------------
 python -m verl.trainer.main_ppo \
-  reward_model.reward_manager=ttrl \
   reward_model.reward_manager=ttrl \
   reward_model.reward_kwargs.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   reward_model.reward_kwargs.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
@@ -318,6 +317,9 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
+  +two_stage_verify=True \
+  +two_stage_mode=sampling \
+  +two_stage_n=8 \
   algorithm.k=4 \
   +algorithm.lam_div=0.05 \
   +algorithm.c_max=2 \
@@ -325,9 +327,9 @@ python -m verl.trainer.main_ppo \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=4 \
+  trainer.n_gpus_per_node=8 \
   trainer.nnodes=1 \
-  trainer.save_freq=60 \
+  trainer.save_freq=15 \
   trainer.test_freq=5 \
   trainer.max_actor_ckpt_to_keep=0 \
   trainer.max_critic_ckpt_to_keep=0 \

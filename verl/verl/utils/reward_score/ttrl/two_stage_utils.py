@@ -369,10 +369,12 @@ def resolve_filtered_pseudo_labels(
     num_prompt_groups = len(prompt_groups)
     
     # Group results by prompt_group_idx
-    group_results: Dict[int, List[Dict]] = {i: [] for i in range(num_prompt_groups)}
+    group_results: Dict[int, List[Dict]] = {}
 
     for output_text, mapping in zip(verification_outputs, verification_mapping):
         group_idx = mapping["prompt_group_idx"]
+        if group_idx not in group_results:
+            group_results[group_idx] = []
         is_true = parse_verification_result(output_text)
 
         group_results[group_idx].append({
@@ -383,12 +385,13 @@ def resolve_filtered_pseudo_labels(
 
     pseudo_labels = [None] * num_prompt_groups
 
-    for group_idx in range(num_prompt_groups):
-        results = group_results[group_idx]
-        original_majority_ans = prompt_groups[group_idx].get("majority_answer")
+    for i, group in enumerate(prompt_groups):
+        group_idx = group["prompt_group_idx"]
+        results = group_results.get(group_idx, [])
+        original_majority_ans = group.get("majority_answer")
         
         if not results:
-            pseudo_labels[group_idx] = original_majority_ans
+            pseudo_labels[i] = original_majority_ans
             continue
             
         candidate_scores: Dict[str, Dict] = {}
@@ -413,10 +416,10 @@ def resolve_filtered_pseudo_labels(
         if valid_candidates:
             # Pick the one with highest original frequency from Pass 1 among valid
             valid_candidates.sort(key=lambda x: x[1], reverse=True)
-            pseudo_labels[group_idx] = valid_candidates[0][0]
+            pseudo_labels[i] = valid_candidates[0][0]
         else:
             # Fallback: direct majority from Pass 1
-            pseudo_labels[group_idx] = original_majority_ans
+            pseudo_labels[i] = original_majority_ans
 
     return pseudo_labels
 
