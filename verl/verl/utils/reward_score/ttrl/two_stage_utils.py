@@ -58,11 +58,13 @@ A previous attempt at this problem resulted in the following answer:
 Act as a rigorous mathematical reviewer. 
 Treat the previous answer ({candidate_answer}) as a given hypothesis. Plug this answer BACK into the original problem conditions. Perform a rigorous backward-substitution to check if it satisfies all constraints or if it leads to a mathematical contradiction. 
 
+You MUST conclude your verification by explicitly stating either "Verification Result: True" (if the hypothesis perfectly satisfies all conditions) or "Verification Result: False" (if it leads to any contradiction).
+
 You MUST strictly use the following XML format for your response:
 <reverse_verification>
 (Your step-by-step backward substitution checking if {candidate_answer} contradicts the problem conditions)
 Verification Result: [True/False]
-</reverse_verification>"""
+"""
 
 
 # ===========================================================================
