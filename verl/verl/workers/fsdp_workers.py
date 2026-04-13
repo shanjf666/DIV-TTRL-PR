@@ -579,10 +579,12 @@ class ActorRolloutRefWorker(Worker):
                 verification_max_tokens = prompts.meta_info.get("verification_max_new_tokens", 512)
                 verification_kwargs = {"max_tokens": verification_max_tokens}
 
-                # For sampling mode verification, pass temperature
+                # For sampling mode verification, pass temperature and top_p
                 if verification_mode == "sampling":
                     verification_temp = prompts.meta_info.get("verification_temperature", 0.6)
+                    verification_top_p = prompts.meta_info.get("verification_top_p", 1.0)
                     verification_kwargs["temperature"] = verification_temp
+                    verification_kwargs["top_p"] = verification_top_p
                     verification_kwargs["n"] = 1  # n is already handled in DataProto construction
 
                 with self.rollout.update_sampling_params(**verification_kwargs):

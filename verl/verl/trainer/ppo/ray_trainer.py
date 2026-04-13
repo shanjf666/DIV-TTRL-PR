@@ -412,7 +412,7 @@ class RayPPOTrainer:
             self.two_stage_mode = getattr(self.config, 'two_stage_mode', 'greedy')  # 'greedy' or 'sampling'
             self.two_stage_n = getattr(self.config, 'two_stage_n', 4)  # N for sampling mode
             self.two_stage_max_candidates = getattr(self.config, 'two_stage_max_candidates', 10)
-            self.two_stage_max_new_tokens = getattr(self.config, 'two_stage_max_new_tokens', 512)
+            self.two_stage_max_new_tokens = getattr(self.config, 'two_stage_max_new_tokens', 2048)
             self.two_stage_fallback = getattr(self.config, 'two_stage_fallback', 'majority')  # 'majority' or 'penalize'
             self.two_stage_micro_batch_size = getattr(self.config, 'two_stage_micro_batch_size', 0)  # 0 = auto
             print(f"[TwoStage] Enabled: mode={self.two_stage_mode}, n={self.two_stage_n}, "
@@ -1034,7 +1034,7 @@ class RayPPOTrainer:
             tokenizer=self.tokenizer,
             n_votes_per_prompt=self.n_votes_per_prompt,
             task=task,
-            max_candidates=5,
+            max_candidates=self.two_stage_max_candidates,
         )
 
         groups_to_verify = []
@@ -1059,7 +1059,7 @@ class RayPPOTrainer:
             prompt_groups=groups_to_verify,
             tokenizer=self.tokenizer,
             verification_mode=self.two_stage_mode,
-            verification_n=self.two_stage_n if self.two_stage_mode == "sampling" else 1,
+            verification_n=self.two_stage_n,  # Pass the config value (use -1 for dynamic frequency)
             max_prompt_length=self.config.data.max_prompt_length * 2,  # verification prompts are longer
         )
 
@@ -1080,8 +1080,9 @@ class RayPPOTrainer:
             verification_batch.meta_info["do_sample"] = False
         else:
             verification_batch.meta_info["do_sample"] = True
-            # Temperature will be passed through for sampling mode
-            verification_batch.meta_info["verification_temperature"] = 0.6
+            # Temperature and top_p will be passed through for sampling mode
+            verification_batch.meta_info["verification_temperature"] = 0.2
+            verification_batch.meta_info["verification_top_p"] = 0.85
 
         # Mark as verification pass (not training vote)
         verification_batch.meta_info["do_vote"] = False
@@ -1096,8 +1097,8 @@ class RayPPOTrainer:
         if self.two_stage_micro_batch_size > 0:
             micro_bs = self.two_stage_micro_batch_size
         else:
-            # Auto: use ~1/4 of the original train batch size, min 4
-            micro_bs = max(4, self.config.data.train_batch_size // 4)
+            # Auto: use the same size as the original train batch size
+            micro_bs = max(4, self.config.data.train_batch_size)
 
         total_verification_size = len(verification_batch)
         all_verification_outputs = []

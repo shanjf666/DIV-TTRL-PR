@@ -139,8 +139,11 @@ def extract_candidate_answers(
 
         # Count frequencies
         counter = Counter(model_answers)
-        # Sort by frequency descending, then limit to max_candidates
-        candidates = counter.most_common(max_candidates)
+        # Sort by frequency descending, then limit to max_candidates if specified
+        if max_candidates is not None and max_candidates > 0:
+            candidates = counter.most_common(max_candidates)
+        else:
+            candidates = counter.most_common()
 
         prompt_groups.append({
             "problem_text": problem_text,
@@ -246,8 +249,16 @@ def construct_verification_dataproto(
             token_ids = encoded["input_ids"]
             attention_mask = encoded["attention_mask"]
 
-            # In sampling mode, repeat for verification_n samples
-            repeat_count = verification_n if verification_mode == "sampling" else 1
+            # In sampling mode, repeat for verification_n samples.
+            # If verification_n is None or < 0, dynamically use candidate frequency.
+            if verification_mode == "sampling":
+                if verification_n is None or verification_n < 0:
+                    repeat_count = frequency
+                else:
+                    repeat_count = verification_n
+            else:
+                repeat_count = 1
+                
             for _ in range(repeat_count):
                 all_token_ids.append(token_ids)
                 all_attention_masks.append(attention_mask)
@@ -408,17 +419,15 @@ def resolve_filtered_pseudo_labels(
             elif r["is_true"] is False:
                 candidate_scores[ans]["false_count"] += 1
                 
-        valid_candidates = []
-        for ans, info in candidate_scores.items():
-            if info["true_count"] > info["false_count"]:
-                valid_candidates.append((ans, info["frequency"]))
+        # All candidates sorted by true_count (desc), then frequency (desc)
+        all_candidates = [(ans, info["true_count"], info["frequency"]) for ans, info in candidate_scores.items()]
+        all_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
                 
-        if valid_candidates:
-            # Pick the one with highest original frequency from Pass 1 among valid
-            valid_candidates.sort(key=lambda x: x[1], reverse=True)
-            pseudo_labels[i] = valid_candidates[0][0]
+        if all_candidates and all_candidates[0][1] > 0:
+            # Pick the one with the highest true_count
+            pseudo_labels[i] = all_candidates[0][0]
         else:
-            # Fallback: direct majority from Pass 1
+            # Fallback: direct majority from Pass 1 if all true_counts are 0
             pseudo_labels[i] = original_majority_ans
 
     return pseudo_labels

@@ -318,8 +318,8 @@ python -m verl.trainer.main_ppo \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
   +two_stage_verify=True \
-  +two_stage_mode=sampling \
-  +two_stage_n=8 \
+  +two_stage_n=-1 \
+  +two_stage_max_candidates=5 \
   algorithm.k=4 \
   +algorithm.lam_div=0.05 \
   +algorithm.c_max=2 \
