@@ -415,9 +415,11 @@ class RayPPOTrainer:
             self.two_stage_max_new_tokens = getattr(self.config, 'two_stage_max_new_tokens', 2048)
             self.two_stage_fallback = getattr(self.config, 'two_stage_fallback', 'majority')  # 'majority' or 'penalize'
             self.two_stage_micro_batch_size = getattr(self.config, 'two_stage_micro_batch_size', 0)  # 0 = auto
+            self.two_stage_temperature = getattr(self.config, 'two_stage_temperature', 0.2)
+            self.two_stage_top_p = getattr(self.config, 'two_stage_top_p', 0.85)
             print(f"[TwoStage] Enabled: mode={self.two_stage_mode}, n={self.two_stage_n}, "
                   f"max_candidates={self.two_stage_max_candidates}, max_new_tokens={self.two_stage_max_new_tokens}, "
-                  f"fallback={self.two_stage_fallback}")
+                  f"fallback={self.two_stage_fallback}, temp={self.two_stage_temperature}, top_p={self.two_stage_top_p}")
 
         self._validate_config()
         self._create_dataloader()
@@ -1087,8 +1089,8 @@ class RayPPOTrainer:
         else:
             verification_batch.meta_info["do_sample"] = True
             # Temperature and top_p will be passed through for sampling mode
-            verification_batch.meta_info["verification_temperature"] = 0.2
-            verification_batch.meta_info["verification_top_p"] = 0.85
+            verification_batch.meta_info["verification_temperature"] = self.two_stage_temperature
+            verification_batch.meta_info["verification_top_p"] = self.two_stage_top_p
 
         # Mark as verification pass (not training vote)
         verification_batch.meta_info["do_vote"] = False
