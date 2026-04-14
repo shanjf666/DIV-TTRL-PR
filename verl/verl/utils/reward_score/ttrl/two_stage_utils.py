@@ -147,6 +147,12 @@ def extract_candidate_answers(
         else:
             candidates = counter.most_common()
 
+        # Extract ground truth
+        ground_truth = ""
+        if group_extra_info and group_extra_info[0]:
+            gt_info = group_extra_info[0].get("reward_model", {})
+            ground_truth = gt_info.get("ground_truth", group_extra_info[0].get("ground_truth", group_extra_info[0].get("answer", "")))
+
         prompt_groups.append({
             "problem_text": problem_text,
             "candidates": candidates,  # List[(answer, count)]
@@ -154,6 +160,7 @@ def extract_candidate_answers(
             "prompt_group_idx": prompt_i,
             "majority_rate": candidates[0][1] / n_votes_per_prompt if candidates else 0.0,
             "majority_answer": candidates[0][0] if candidates else None,
+            "ground_truth": ground_truth,
         })
 
     return prompt_groups
@@ -453,6 +460,7 @@ def compute_proxy_cm_reward(
     verification_mapping: List[Dict],
     final_pseudo_labels: Dict[int, str],
     consistency_scores: Dict[int, float],
+    gt_correct_scores: Optional[List[bool]] = None,
 ) -> Tuple[List[float], Dict[str, float]]:
     """Compute surrogate CM rewards for each verification sample based on standard rules.
     
@@ -461,10 +469,11 @@ def compute_proxy_cm_reward(
         verification_mapping: Output from construct_verification_dataproto().
         final_pseudo_labels: Dict mapping prompt_group_idx to the chosen pseudo label string.
         consistency_scores: Dict mapping prompt_group_idx to the consistency float.
+        gt_correct_scores: Optional list of booleans indicating if the candidate answer is equal to ground truth.
         
     Returns:
         rewards: List of float rewards
-        metrics: Dict with tp/tn/fp/fn and format error rates.
+        metrics: Dict with tp/tn/fp/fn, format error rates, and GT CM metrics (if gt_correct_scores is provided).
     """
     rewards = []
     
@@ -475,7 +484,13 @@ def compute_proxy_cm_reward(
     format_error_count = 0
     total = len(verification_outputs)
     
-    for output_text, mapping in zip(verification_outputs, verification_mapping):
+    # GT-based confusion matrix counters
+    gt_tp_count = 0
+    gt_tn_count = 0
+    gt_fp_count = 0
+    gt_fn_count = 0
+
+    for i, (output_text, mapping) in enumerate(zip(verification_outputs, verification_mapping)):
         group_idx = mapping["prompt_group_idx"]
         candidate = mapping["candidate_answer"]
         
@@ -497,6 +512,20 @@ def compute_proxy_cm_reward(
             
         parsed_result = parse_verification_result(output_text)
         is_pl = (candidate == pl)
+        
+        # Calculate GT logic if gt_correct_scores is provided
+        if gt_correct_scores is not None and i < len(gt_correct_scores):
+            is_gt_correct = gt_correct_scores[i]
+            if parsed_result is True:
+                if is_gt_correct:
+                    gt_tp_count += 1
+                else:
+                    gt_fp_count += 1
+            elif parsed_result is False:
+                if is_gt_correct:
+                    gt_fn_count += 1
+                else:
+                    gt_tn_count += 1
         
         if parsed_result is None:
             # Format exists but result can't be parsed properly (e.g. "Verification Result: maybe")
@@ -523,6 +552,15 @@ def compute_proxy_cm_reward(
         "format_error_rate": format_error_count / total if total > 0 else 0.0,
         "reward_mean": sum(rewards) / total if total > 0 else 0.0,
     }
+
+    if gt_correct_scores is not None:
+        total_gt_valid = gt_tp_count + gt_tn_count + gt_fp_count + gt_fn_count
+        metrics.update({
+            "gt_tp_rate": gt_tp_count / total_gt_valid if total_gt_valid > 0 else 0.0,
+            "gt_tn_rate": gt_tn_count / total_gt_valid if total_gt_valid > 0 else 0.0,
+            "gt_fp_rate": gt_fp_count / total_gt_valid if total_gt_valid > 0 else 0.0,
+            "gt_fn_rate": gt_fn_count / total_gt_valid if total_gt_valid > 0 else 0.0,
+        })
     
     return rewards, metrics
 

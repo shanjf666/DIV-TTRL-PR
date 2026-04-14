@@ -1317,6 +1317,19 @@ class RayPPOTrainer:
 
                     # ================================================================
                     # Pass 2: Two-Stage Self-Verification
+                    
+                    # Initialize GT metrics to 0 in case Verification is not triggered
+                    metrics.update({
+                        "train/tp_rate": 0.0,
+                        "train/tn_rate": 0.0,
+                        "train/fp_rate": 0.0,
+                        "train/fn_rate": 0.0,
+                        "train/gt_tp_rate": 0.0,
+                        "train/gt_tn_rate": 0.0,
+                        "train/gt_fp_rate": 0.0,
+                        "train/gt_fn_rate": 0.0,
+                    })
+
                     batch_second = None
                     if self.use_ttrl and self.two_stage_verify:
                         with _timer("two_stage_verify", timing_raw):
@@ -1354,8 +1367,23 @@ class RayPPOTrainer:
                                     for g in groups_to_verify
                                 }
                                 
+                                # Calculate GT correctness for candidates
+                                from verl.utils.reward_score.math_verify import compute_score
+                                gt_correct_scores = []
+                                for m in verify_mapping:
+                                    g_idx = m["prompt_group_idx"]
+                                    cand = m["candidate_answer"]
+                                    gt = ""
+                                    for g in groups_to_verify:
+                                        if g["prompt_group_idx"] == g_idx:
+                                            gt = g.get("ground_truth", "")
+                                            break
+                                    # evaluate GT truth
+                                    is_correct = compute_score(cand, gt) > 0.0 if gt else False
+                                    gt_correct_scores.append(is_correct)
+
                                 rewards, cm_metrics = compute_proxy_cm_reward(
-                                    verify_outputs, verify_mapping, final_pseudo_labels_dict, consistency_scores
+                                    verify_outputs, verify_mapping, final_pseudo_labels_dict, consistency_scores, gt_correct_scores
                                 )
                                 metrics.update({"train/" + k: v for k, v in cm_metrics.items()})
                                 

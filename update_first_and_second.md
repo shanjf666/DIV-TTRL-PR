@@ -77,3 +77,22 @@
 - **现象**：在多 GPU 训练时，日志输出卡住，GPU 利用率飙升至 100% 却无法进入下一步（即“假死”）。
 - **根因**：第二阶段数据采样是随机且分布不均的，某些 GPU 可能被分配了较多需要验证的候选答案，某些 GPU 可能为 0。在原生逻辑下，不同 GPU 在 `update_policy` 内执⾏了不同次数的 `loss.backward()`。在使用 FSDP / DDP 的分布式数据并行模型下，任何一次 `backward()` 都会触发全卡的梯度 All-Reduce 通信！当部分 GPU 提前退出循环时，还在循环内的 GPU 会因为等不到通信响应而发生死锁瘫痪。
 - **修复**：重构了 `dp_actor.py` 中的 Stage 2 Backward 循环逻辑。利用 PyTorch 的分布式规约（`torch.distributed.all_reduce(op=MAX)`），动态感知全局最大的验证微批次数量并进行 Padding 对齐。缺乏验证数据的 Rank 也会强制经历同等次数的循环并执行 `(loss * 0.0).backward()` 来填补空的通信帧，成功解决了由数据数量不对齐而引发的跨卡通信死锁。
+
+## 7. 验证性能监控增强 (Metrics V2)
+
+为了更直观地评估 Verifier 的判断质量，系统引入了基于 Ground Truth (GT) 的对比指标，并解决了特定情况下的指标缺失问题。修改涉及 `ray_trainer.py` 与 `two_stage_utils.py`。
+
+### 7.1 指标初始化兜底
+- **现象**：在没有问题触发第二阶段验证的训练步进中，相关的混淆矩阵指标（如 `train/fn_rate`）会因为没有被写入 `metrics` 字典而在 WandB 等监控后台显示为缺失（断线）。
+- **优化**：在 `ray_trainer.py` 的 PPO 训练循环开始处，显式将所有验证相关指标（包括原有的 Proxy 指标和新增的 GT 指标）初始化为 `0.0`，确保监控曲线的连续性。
+
+### 7.2 增加基于真值 (Ground Truth) 的混淆矩阵
+- **原理**：原有的 TP/TN 指标是基于模型“最终选出的伪标签”计算的（即 Surrogate/Proxy 指标）。现在新增了基于数据集“真值答案 (Ground Truth)”的评估指标：
+    - **GT_TP**: Verifier 认为是 True，且该候选答案确实是正确的（GT）。
+    - **GT_FP**: Verifier 认为是 True，但该候选答案其实是错误的（**Verifier 被误导，高风险指标**）。
+    - **GT_TN**: Verifier 认为是 False，且该候选答案确实是错误的（GT）。
+    - **GT_FN**: Verifier 认为是 False，但该候选答案其实是正确的（Verifier 过于严苛）。
+- **实现逻辑**：
+    - 在答案提取阶段同步抓取 `extra_info` 中的真值文本。
+    - 在验证奖励计算前，调用 `math_verify.compute_score` 对每一个验证样本的候选答案进行真值对错判定。
+    - 将判定结果作为掩码传入奖励函数，计算得到对应的 `gt_tp_rate` / `gt_fp_rate` / `gt_tn_rate` / `gt_fn_rate` 并同步至监控平台。
