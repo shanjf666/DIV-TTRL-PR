@@ -18,6 +18,7 @@ Single Process Actor
 import itertools
 from typing import Tuple
 
+import numpy as np
 import torch
 from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn
