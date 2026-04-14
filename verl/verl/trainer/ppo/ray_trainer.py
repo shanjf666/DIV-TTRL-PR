@@ -1645,7 +1645,8 @@ class RayPPOTrainer:
                                 batch_second.meta_info["has_second_stage"] = True
                                 actor_output = self.actor_rollout_wg.update_actor(batch, batch_second)
                             else:
-                                dummy_second = batch[:1]
+                                # Fix: match world_size so chunking works (1 sample per GPU)
+                                dummy_second = batch[:self.actor_rollout_wg.world_size]
                                 dummy_second.meta_info["has_second_stage"] = False
                                 actor_output = self.actor_rollout_wg.update_actor(batch, dummy_second)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])

@@ -78,6 +78,11 @@
 - **根因**：第二阶段数据采样是随机且分布不均的，某些 GPU 可能被分配了较多需要验证的候选答案，某些 GPU 可能为 0。在原生逻辑下，不同 GPU 在 `update_policy` 内执⾏了不同次数的 `loss.backward()`。在使用 FSDP / DDP 的分布式数据并行模型下，任何一次 `backward()` 都会触发全卡的梯度 All-Reduce 通信！当部分 GPU 提前退出循环时，还在循环内的 GPU 会因为等不到通信响应而发生死锁瘫痪。
 - **修复**：重构了 `dp_actor.py` 中的 Stage 2 Backward 循环逻辑。利用 PyTorch 的分布式规约（`torch.distributed.all_reduce(op=MAX)`），动态感知全局最大的验证微批次数量并进行 Padding 对齐。缺乏验证数据的 Rank 也会强制经历同等次数的循环并执行 `(loss * 0.0).backward()` 来填补空的通信帧，成功解决了由数据数量不对齐而引发的跨卡通信死锁。
 
+### 6.4 分布式占位数据切分错误 (AssertionError)
+- **现象**：当没有任何问题触发第二阶段验证时（`batch_second` 为空），系统抛出 `AssertionError: only support equal chunk. Got size of DataProto 1 and chunk 8`。
+- **原因**：分布式通信装饰器（Ray Dispatcher）要求输入的 DataProto 必须能被 GPU 数量（`world_size`）整除。原先使用的 `batch[:1]` 占位符无法平分给 8 张显卡。
+- **修复**：在 `ray_trainer.py` 中将占位数据的长度动态对齐为当前 `world_size`（即 `batch[:self.actor_rollout_wg.world_size]`）。这样每张显卡分得 1 条数据，满足了框架的切分要求；同时配合 `has_second_stage=False` 标记，确保底层 Worker 依然会跳过所有真实的损失计算，不产生额外开销。
+
 ## 7. 验证性能监控增强 (Metrics V2)
 
 为了更直观地评估 Verifier 的判断质量，系统引入了基于 Ground Truth (GT) 的对比指标，并解决了特定情况下的指标缺失问题。修改涉及 `ray_trainer.py` 与 `two_stage_utils.py`。
