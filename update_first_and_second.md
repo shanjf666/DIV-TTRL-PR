@@ -73,3 +73,7 @@
 - **现象**：当第一阶段开启 KL 散度约束时，底层 `DataProto.select` 会强制要求所有数据批次（包含第二阶段数据）都必须拥有 `ref_log_prob` 字段。由于 Verifier 的 Rollouts 并没有计算该字段，导致训练中断。
 - **修复**：在 `dp_actor.py` 的 `update_policy` 函数中引入了**动态键值过滤机制**。它会自动检测当前 `DataProto` 实际拥有的 Key，确保护理第二阶段数据时不再强行索取不存在的 KL 相关字段，从而支持 Generator 有 KL 约束而 Verifier 无 KL 约束的异构训练模式。
 
+### 6.3 分布式验证导致的梯度同步死锁 (Distributed Deadlock)
+- **现象**：在多 GPU 训练时，日志输出卡住，GPU 利用率飙升至 100% 却无法进入下一步（即“假死”）。
+- **根因**：第二阶段数据采样是随机且分布不均的，某些 GPU 可能被分配了较多需要验证的候选答案，某些 GPU 可能为 0。在原生逻辑下，不同 GPU 在 `update_policy` 内执⾏了不同次数的 `loss.backward()`。在使用 FSDP / DDP 的分布式数据并行模型下，任何一次 `backward()` 都会触发全卡的梯度 All-Reduce 通信！当部分 GPU 提前退出循环时，还在循环内的 GPU 会因为等不到通信响应而发生死锁瘫痪。
+- **修复**：重构了 `dp_actor.py` 中的 Stage 2 Backward 循环逻辑。利用 PyTorch 的分布式规约（`torch.distributed.all_reduce(op=MAX)`），动态感知全局最大的验证微批次数量并进行 Padding 对齐。缺乏验证数据的 Rank 也会强制经历同等次数的循环并执行 `(loss * 0.0).backward()` 来填补空的通信帧，成功解决了由数据数量不对齐而引发的跨卡通信死锁。

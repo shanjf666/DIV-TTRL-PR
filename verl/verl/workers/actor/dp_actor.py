@@ -441,44 +441,65 @@ class DataParallelPPOActor(BasePPOActor):
                 # Stage 2 Backward Pass (for this mini-batch)
                 # ==========================================================
                 current_v_groups = verification_mini_batches[batch_idx] if batch_idx < len(verification_mini_batches) else []
-                if current_v_groups:
-                    num_groups = len(current_v_groups)
+                
+                # Extract all micro batches for this mini batch
+                current_v_mbs = []
+                for group_batch in current_v_groups:
+                    mbs = group_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    current_v_mbs.extend(mbs)
+                
+                # Synchronize maximum micro-batches across FSDP ranks
+                device = torch.cuda.current_device()
+                num_mbs_local = torch.tensor([len(current_v_mbs)], dtype=torch.int32, device=device)
+                
+                if torch.distributed.is_initialized():
+                    torch.distributed.all_reduce(num_mbs_local, op=torch.distributed.ReduceOp.MAX)
+                
+                num_mbs_max = num_mbs_local.item()
+
+                if num_mbs_max > 0:
                     group_losses = []
+                    # Use a micro-batch from Stage 1 as DUMMY fallback if no Stage 2 data exists on this rank
+                    fallback_dummy_mb = micro_batches[0] 
                     
-                    for group_batch in current_v_groups:
-                        # Split group into micro-batches to avoid OOM
-                        group_micro_batches = group_batch.split(self.config.ppo_micro_batch_size_per_gpu)
-                        num_group_mbs = len(group_micro_batches)
+                    for t in range(num_mbs_max):
+                        is_dummy = (t >= len(current_v_mbs))
+                        if is_dummy:
+                            mb_s = current_v_mbs[-1] if len(current_v_mbs) > 0 else fallback_dummy_mb
+                        else:
+                            mb_s = current_v_mbs[t]
+                            
+                        mb_s = mb_s.to(device)
+                        response_mask_s = mb_s["attention_mask"][:, -mb_s["responses"].size(1):]
                         
-                        for mb_s in group_micro_batches:
-                            mb_s = mb_s.to(torch.cuda.current_device())
-                            response_mask_s = mb_s["attention_mask"][:, -mb_s["responses"].size(1):]
-                            
-                            _, log_prob_s, _ = self._forward_micro_batch(
-                                micro_batch=mb_s, temperature=temperature, calculate_entropy=False, compute_topk=False
-                            )
-                            
-                            # GRPO loss is just pg_loss since we already computed advantages based on group 
-                            pg_loss_s, _, _, _ = compute_policy_loss(
-                                old_log_prob=mb_s["old_log_probs"],
-                                log_prob=log_prob_s,
-                                advantages=mb_s["advantages"],
-                                response_mask=response_mask_s,
-                                cliprange=self.config.clip_ratio,
-                                cliprange_low=self.config.get("clip_ratio_low", self.config.clip_ratio),
-                                cliprange_high=self.config.get("clip_ratio_high", self.config.clip_ratio),
-                                clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
-                                loss_agg_mode=self.config.loss_agg_mode,
-                            )
-                            
-                            # group_loss = mean over micro-batches. total_loss = mean over groups.
-                            # So loss_s = pg_loss_s / (num_groups * num_group_mbs)
-                            # lambda_second is already multiplied into advantages inside ray_trainer.py!
-                            loss_s = pg_loss_s / (num_groups * num_group_mbs)
-                            loss_s.backward()
+                        _, log_prob_s, _ = self._forward_micro_batch(
+                            micro_batch=mb_s, temperature=temperature, calculate_entropy=False, compute_topk=False
+                        )
+                        
+                        # GRPO loss is just pg_loss since we already computed advantages based on group 
+                        pg_loss_s, _, _, _ = compute_policy_loss(
+                            old_log_prob=mb_s["old_log_probs"],
+                            log_prob=log_prob_s,
+                            advantages=mb_s["advantages"],
+                            response_mask=response_mask_s,
+                            cliprange=self.config.clip_ratio,
+                            cliprange_low=self.config.get("clip_ratio_low", self.config.clip_ratio),
+                            cliprange_high=self.config.get("clip_ratio_high", self.config.clip_ratio),
+                            clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+                            loss_agg_mode=self.config.loss_agg_mode,
+                        )
+                        
+                        if is_dummy:
+                            loss_s = pg_loss_s * 0.0
+                        else:
+                            # Divide by len(current_v_mbs) locally. DDP will average this across world_size
+                            loss_s = pg_loss_s / max(1, len(current_v_mbs))
                             group_losses.append(pg_loss_s.detach().item())
                             
-                    metrics["actor/second_stage_loss"] = sum(group_losses) / len(group_losses)
+                        loss_s.backward()
+                        
+                    if group_losses:
+                        metrics["actor/second_stage_loss"] = sum(group_losses) / len(group_losses)
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
