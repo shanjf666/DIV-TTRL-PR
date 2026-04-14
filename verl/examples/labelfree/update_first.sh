@@ -318,9 +318,13 @@ python -m verl.trainer.main_ppo \
   algorithm.kl_ctrl.kl_coef=0.00 \
   algorithm.adv_estimator=$ADVANTAGE \
   +two_stage_verify=True \
-  +two_stage_n=-1 \
+  +two_stage_mode=sampling \
+  +two_stage_n=8 \
+  +two_stage_micro_batch_size=16 \
+  +two_stage_max_new_tokens=2048 \
   +two_stage_max_candidates=5 \
   algorithm.k=4 \
+  +algorithm.lambda_second=0.5 \
   +algorithm.lam_div=0.05 \
   +algorithm.c_max=2 \
   +algorithm.div_sc_threshold=0.5 \

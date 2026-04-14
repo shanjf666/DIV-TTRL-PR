@@ -361,7 +361,7 @@ def resolve_filtered_pseudo_labels(
     verification_outputs: List[str],
     verification_mapping: List[Dict],
     prompt_groups: List[Dict],
-) -> List[Optional[str]]:
+) -> Tuple[List[Optional[str]], List[float]]:
     """Match verification results back to prompt groups and resolve the best pseudo-label.
     
     Filters candidates based on majority vote (True_votes > False_votes).
@@ -373,7 +373,9 @@ def resolve_filtered_pseudo_labels(
         prompt_groups: Output of extract_candidate_answers(), contains fallback info.
 
     Returns:
-        List of length len(prompt_groups), each containing the selected pseudo-label answer.
+        Tuple of:
+            - List of length len(prompt_groups), each containing the selected pseudo-label answer.
+            - List of length len(prompt_groups), each containing the consistency score of the selected pseudo-label.
     """
     assert len(verification_outputs) == len(verification_mapping), (
         f"Mismatch: {len(verification_outputs)} outputs vs {len(verification_mapping)} mappings"
@@ -397,6 +399,7 @@ def resolve_filtered_pseudo_labels(
         })
 
     pseudo_labels = [None] * num_prompt_groups
+    consistencies = [0.0] * num_prompt_groups
 
     for i, group in enumerate(prompt_groups):
         group_idx = group["prompt_group_idx"]
@@ -428,11 +431,100 @@ def resolve_filtered_pseudo_labels(
         if all_candidates and all_candidates[0][1] > 0:
             # Pick the one with the highest true_count
             pseudo_labels[i] = all_candidates[0][0]
+            # Consistency is frequency / total votes
+            # wait, n_votes_per_prompt is not passed directly, but majority_rate is frequency / n_votes.
+            # freq = all_candidates[0][2]
+            # Since majority_rate = cand[0][1] / N, we can calculate N = cand[0][1] / majority_rate
+            # But the simplest is to find the overall candidate freq within the group
+            freq = all_candidates[0][2]
+            top_freq = group["candidates"][0][1] if group["candidates"] else 1
+            majority_rate = group.get("majority_rate", 0.0)
+            n_votes = top_freq / majority_rate if majority_rate > 0 else 1
+            consistencies[i] = freq / n_votes
         else:
             # Fallback: direct majority from Pass 1 if all true_counts are 0
             pseudo_labels[i] = original_majority_ans
+            consistencies[i] = group.get("majority_rate", 0.0)
 
-    return pseudo_labels
+    return pseudo_labels, consistencies
+
+def compute_proxy_cm_reward(
+    verification_outputs: List[str],
+    verification_mapping: List[Dict],
+    final_pseudo_labels: Dict[int, str],
+    consistency_scores: Dict[int, float],
+) -> Tuple[List[float], Dict[str, float]]:
+    """Compute surrogate CM rewards for each verification sample based on standard rules.
+    
+    Args:
+        verification_outputs: List of decoded verification response strings.
+        verification_mapping: Output from construct_verification_dataproto().
+        final_pseudo_labels: Dict mapping prompt_group_idx to the chosen pseudo label string.
+        consistency_scores: Dict mapping prompt_group_idx to the consistency float.
+        
+    Returns:
+        rewards: List of float rewards
+        metrics: Dict with tp/tn/fp/fn and format error rates.
+    """
+    rewards = []
+    
+    tp_count = 0
+    tn_count = 0
+    fp_count = 0
+    fn_count = 0
+    format_error_count = 0
+    total = len(verification_outputs)
+    
+    for output_text, mapping in zip(verification_outputs, verification_mapping):
+        group_idx = mapping["prompt_group_idx"]
+        candidate = mapping["candidate_answer"]
+        
+        pl = final_pseudo_labels.get(group_idx)
+        consistency = consistency_scores.get(group_idx, 1.0)
+        
+        # Check format
+        has_tag = False
+        has_result = False
+        if output_text:
+            text_lower = output_text.lower()
+            has_tag = "<reverse_verification>" in text_lower or "reverse_verification" in text_lower
+            has_result = "verification result" in text_lower
+            
+        if not (has_tag and has_result):
+            rewards.append(-1.0)
+            format_error_count += 1
+            continue
+            
+        parsed_result = parse_verification_result(output_text)
+        is_pl = (candidate == pl)
+        
+        if parsed_result is None:
+            # Format exists but result can't be parsed properly (e.g. "Verification Result: maybe")
+            rewards.append(-1.0)
+            format_error_count += 1
+        elif is_pl and parsed_result is True:   # TP
+            rewards.append(1.0 * consistency)
+            tp_count += 1
+        elif not is_pl and parsed_result is False: # TN
+            rewards.append(1.0 * consistency)
+            tn_count += 1
+        elif not is_pl and parsed_result is True:  # FP
+            rewards.append(-1.0 * consistency)
+            fp_count += 1
+        elif is_pl and parsed_result is False:   # FN
+            rewards.append(-0.5 * consistency)
+            fn_count += 1
+            
+    metrics = {
+        "tp_rate": tp_count / total if total > 0 else 0.0,
+        "tn_rate": tn_count / total if total > 0 else 0.0,
+        "fp_rate": fp_count / total if total > 0 else 0.0,
+        "fn_rate": fn_count / total if total > 0 else 0.0,
+        "format_error_rate": format_error_count / total if total > 0 else 0.0,
+        "reward_mean": sum(rewards) / total if total > 0 else 0.0,
+    }
+    
+    return rewards, metrics
 
 
 # ===========================================================================

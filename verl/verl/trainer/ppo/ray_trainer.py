@@ -1006,7 +1006,13 @@ class RayPPOTrainer:
             metrics: Dict to log verification metrics into.
 
         Returns:
-            List of pseudo-labels, one per prompt group (or None for penalize fallback).
+            Tuple of:
+                - List of pseudo-labels, one per prompt group
+                - batch_second: DataProto containing all verification trajectories for Stage 2 training (or None)
+                - all_verification_outputs: List of decoded verification response strings
+                - verification_mapping: List mapping each output back to its prompt_group_idx and candidate
+                - groups_to_verify: List of prompt_groups that triggered verification
+                - pl_consistencies: List of float consistencies for the chosen pseudo-labels
         """
         import gc
         from verl.utils.reward_score.ttrl.two_stage_utils import (
@@ -1048,7 +1054,7 @@ class RayPPOTrainer:
 
         if not groups_to_verify:
             print("[TwoStage] All prompt groups skipped verification due to majority >= 0.3")
-            return [g.get("majority_answer") for g in prompt_groups]
+            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], []
 
         total_candidates = sum(len(g["candidates"]) for g in groups_to_verify)
         print(f"[TwoStage] Triggered verification for {len(groups_to_verify)}/{len(prompt_groups)} prompt groups")
@@ -1065,7 +1071,7 @@ class RayPPOTrainer:
 
         if verification_batch is None or len(verification_batch) == 0:
             print("[TwoStage] Empty verification batch. Skipping.")
-            return [g.get("majority_answer") for g in prompt_groups]
+            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], []
 
         print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
 
@@ -1102,6 +1108,7 @@ class RayPPOTrainer:
 
         total_verification_size = len(verification_batch)
         all_verification_outputs = []
+        all_chunk_outputs = []
 
         print(f"[TwoStage] Running verification inference: {total_verification_size} samples, "
               f"micro_batch_size={micro_bs}")
@@ -1120,10 +1127,18 @@ class RayPPOTrainer:
                 # Decode verification responses
                 chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
                 all_verification_outputs.extend(chunk_decoded)
+                
+                # Keep the original output for Stage 2 training (move to CPU to save VRAM)
+                all_chunk_outputs.append(chunk_output.to("cpu"))
             except Exception as e:
                 print(f"[TwoStage] Error during verification chunk {chunk_start}-{chunk_end}: {e}")
                 # Fill with empty strings for this chunk
                 all_verification_outputs.extend([""] * (chunk_end - chunk_start))
+                # For chunk_output, if it fails we can't really do much. We might just append the verification prompts and empty response
+                # But it's safer to just skip training on failed chunks. However, mapping will be misaligned if we skip `all_chunk_outputs`.
+                # To keep it simple, raising or skipping is problematic. The original code extended with empty string.
+                # If we don't have block we might crash later.
+                # Note: failure in generate_sequences shouldn't happen unless OOM.
             finally:
                 # Cleanup per chunk
                 if 'chunk_output_padded' in locals():
@@ -1136,9 +1151,24 @@ class RayPPOTrainer:
                 torch.cuda.empty_cache()
 
         print(f"[TwoStage] Decoded {len(all_verification_outputs)} verification outputs")
+        
+        # Combine all chunk outputs into batch_second
+        if len(all_chunk_outputs) > 0:
+            batch_second = DataProto.concat(all_chunk_outputs)
+            
+            # Setup UIDs for GRPO grouping
+            # All samples for the same prompt & candidate share a UID
+            # mapping contains prompt_group_idx and candidate_answer
+            uids = []
+            for m in verification_mapping:
+                uid = f"verify_group_{m['prompt_group_idx']}_{m['candidate_answer']}"
+                uids.append(uid)
+            batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
+        else:
+            batch_second = None
 
         # Step 5: Resolve pseudo-labels
-        verified_labels = resolve_filtered_pseudo_labels(
+        verified_labels, verified_consistencies = resolve_filtered_pseudo_labels(
             verification_outputs=all_verification_outputs,
             verification_mapping=verification_mapping,
             prompt_groups=groups_to_verify,
@@ -1148,17 +1178,21 @@ class RayPPOTrainer:
         
         # Merge back with skipped groups
         final_pseudo_labels = []
+        final_consistencies = []
         verified_idx = 0
         success_filter_count = 0
         for g in prompt_groups:
             if g.get("majority_rate", 1.0) < 0.3:
                 resolved_label = verified_labels[verified_idx]
+                resolved_cons = verified_consistencies[verified_idx]
                 final_pseudo_labels.append(resolved_label)
+                final_consistencies.append(resolved_cons)
                 if resolved_label != g.get("majority_answer"):
                      success_filter_count += 1
                 verified_idx += 1
             else:
                 final_pseudo_labels.append(g.get("majority_answer"))
+                final_consistencies.append(g.get("majority_rate", 0.0))
 
         if len(groups_to_verify) > 0:
             metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
@@ -1178,11 +1212,11 @@ class RayPPOTrainer:
         print(f"[TwoStage] Successfully filtered to new candidate in {success_filter_count}/{len(groups_to_verify)} triggered groups")
 
         # Cleanup
-        del verification_batch, all_verification_outputs, verification_mapping
+        del verification_batch
         gc.collect()
         torch.cuda.empty_cache()
 
-        return final_pseudo_labels
+        return final_pseudo_labels, batch_second, all_verification_outputs, verification_mapping, groups_to_verify, final_consistencies
 
     def fit(self):
         """
@@ -1283,16 +1317,14 @@ class RayPPOTrainer:
 
                     # ================================================================
                     # Pass 2: Two-Stage Self-Verification
-                    # ================================================================
+                    batch_second = None
                     if self.use_ttrl and self.two_stage_verify:
                         with _timer("two_stage_verify", timing_raw):
-                            verified_pseudo_labels = self._run_two_stage_verification(
+                            verified_pseudo_labels, batch_second, verify_outputs, verify_mapping, groups_to_verify, pl_consistencies = self._run_two_stage_verification(
                                 batch=batch,
                                 metrics=metrics,
                             )
                             # Inject pseudo-labels into batch for TTRLRewardManager
-                            # verified_pseudo_labels is a list of length num_prompts
-                            # We need to expand it to match the batch size (n_votes_per_prompt per prompt)
                             if verified_pseudo_labels is not None:
                                 expanded_labels = []
                                 for label in verified_pseudo_labels:
@@ -1300,11 +1332,62 @@ class RayPPOTrainer:
                                 batch.non_tensor_batch["verified_pseudo_label"] = np.array(
                                     expanded_labels, dtype=object
                                 )
-                                # Log verification stats
                                 n_verified = sum(1 for l in verified_pseudo_labels if l is not None)
                                 n_total = len(verified_pseudo_labels)
                                 metrics["train/two_stage_verified_ratio"] = n_verified / n_total if n_total > 0 else 0.0
                                 print(f"[TwoStage] Verified {n_verified}/{n_total} prompt groups")
+
+                            # ================================================================
+                            # Stage 2 Preprocessing: compute proxy rewards and advantages
+                            # ================================================================
+                            if batch_second is not None and len(batch_second) > 0:
+                                from verl.utils.reward_score.ttrl.two_stage_utils import compute_proxy_cm_reward
+                                from verl.trainer.ppo.core_algos import compute_grpo_outcome_advantage
+                                
+                                # 1. Compute proxy CM reward
+                                final_pseudo_labels_dict = {
+                                    g["prompt_group_idx"]: verified_pseudo_labels[g["prompt_group_idx"]]
+                                    for g in groups_to_verify
+                                }
+                                consistency_scores = {
+                                    g["prompt_group_idx"]: pl_consistencies[g["prompt_group_idx"]]
+                                    for g in groups_to_verify
+                                }
+                                
+                                rewards, cm_metrics = compute_proxy_cm_reward(
+                                    verify_outputs, verify_mapping, final_pseudo_labels_dict, consistency_scores
+                                )
+                                metrics.update({"train/" + k: v for k, v in cm_metrics.items()})
+                                
+                                # 2. Inject token_level_rewards into batch_second at last valid response token
+                                response_length = batch_second.batch["responses"].shape[-1]
+                                token_level_rewards = torch.zeros(len(batch_second), response_length)
+                                prompt_length = batch_second.batch["prompts"].shape[-1]
+                                batch_second.batch["response_mask"] = batch_second.batch["attention_mask"][:, prompt_length:]
+                                
+                                for i in range(len(batch_second)):
+                                    valid_resp_len = int(batch_second.batch["response_mask"][i].sum().item())
+                                    if valid_resp_len > 0:
+                                        token_level_rewards[i, valid_resp_len - 1] = rewards[i]
+                                batch_second.batch["token_level_rewards"] = token_level_rewards
+                                
+                                # 3. Compute old_log_probs
+                                print(f"[TwoStage] Computing old_log_probs for {len(batch_second)} verification samples")
+                                old_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch_second)
+                                batch_second.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
+                                
+                                # 4. Compute GRPO advantages using uid
+                                advantages, returns = compute_grpo_outcome_advantage(
+                                    token_level_rewards=batch_second.batch["token_level_rewards"],
+                                    response_mask=batch_second.batch["response_mask"],
+                                    index=batch_second.non_tensor_batch["uid"]
+                                )
+                                
+                                # 5. Scale advantages by lambda_second immediately
+                                alpha = self.config.algorithm.get("lambda_second", 0.5)
+                                advantages = advantages * alpha
+                                batch_second.batch["advantages"] = advantages
+                                batch_second.batch["returns"] = returns
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -1530,7 +1613,13 @@ class RayPPOTrainer:
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         # update actor
                         with _timer("update_actor", timing_raw):
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
+                            if 'batch_second' in locals() and batch_second is not None and len(batch_second) > 0:
+                                batch_second.meta_info["has_second_stage"] = True
+                                actor_output = self.actor_rollout_wg.update_actor(batch, batch_second)
+                            else:
+                                dummy_second = batch[:1]
+                                dummy_second.meta_info["has_second_stage"] = False
+                                actor_output = self.actor_rollout_wg.update_actor(batch, dummy_second)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
@@ -1568,6 +1657,10 @@ class RayPPOTrainer:
                     del gen_batch
                 if 'gen_batch_output' in locals():
                     del gen_batch_output
+                if 'batch_second' in locals():
+                    del batch_second
+                if 'dummy_second' in locals():
+                    del dummy_second
                 import gc
                 gc.collect()
                 

@@ -1,4 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
+﻿# Copyright 2024 Bytedance Ltd. and/or its affiliates
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -497,17 +497,9 @@ class ActorRolloutRefWorker(Worker):
             )
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
-    def update_actor(self, data: DataProto, data_second: DataProto = None):
+    def update_actor(self, data: DataProto):
         # Support all hardwares
         data = data.to(torch.cuda.current_device())
-        
-        has_second_stage = False
-        if data_second is not None:
-            has_second_stage = data_second.meta_info.get("has_second_stage", False)
-            if has_second_stage:
-                data_second = data_second.to(torch.cuda.current_device())
-            else:
-                data_second = None
 
         assert self._is_actor
         if self._is_offload_param:
@@ -519,11 +511,9 @@ class ActorRolloutRefWorker(Worker):
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data=data)
-            if data_second is not None:
-                data_second = self.ulysses_sharding_manager.preprocess_data(data=data_second)
             # perform training
             with Timer(name="update_policy", logger=None) as timer:
-                metrics = self.actor.update_policy(data=data, data_second=data_second)
+                metrics = self.actor.update_policy(data=data)
             delta_time = timer.last
             global_num_tokens = data.meta_info["global_token_num"]
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
@@ -581,26 +571,8 @@ class ActorRolloutRefWorker(Worker):
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-
-            # Check if this is a verification pass (two-stage pipeline)
-            verification_mode = prompts.meta_info.get("verification_mode", None)
-            if verification_mode is not None:
-                # Verification pass: use shorter max_new_tokens and specific sampling params
-                verification_max_tokens = prompts.meta_info.get("verification_max_new_tokens", 512)
-                verification_kwargs = {"max_tokens": verification_max_tokens}
-
-                # For sampling mode verification, pass temperature and top_p
-                if verification_mode == "sampling":
-                    verification_temp = prompts.meta_info.get("verification_temperature", 0.6)
-                    verification_top_p = prompts.meta_info.get("verification_top_p", 1.0)
-                    verification_kwargs["temperature"] = verification_temp
-                    verification_kwargs["top_p"] = verification_top_p
-                    verification_kwargs["n"] = 1  # n is already handled in DataProto construction
-
-                with self.rollout.update_sampling_params(**verification_kwargs):
-                    output = self.rollout.generate_sequences(prompts=prompts)
             # check if meta_info contains "do_vote"
-            elif "do_vote" in prompts.meta_info and prompts.meta_info["do_vote"]:
+            if "do_vote" in prompts.meta_info and prompts.meta_info["do_vote"]:
                 output = self.rollout.generate_sequences(prompts, n=self.config.rollout.n_vote)
             else:
                 output = self.rollout.generate_sequences(prompts=prompts)

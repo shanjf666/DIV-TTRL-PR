@@ -273,7 +273,7 @@ class DataParallelPPOActor(BasePPOActor):
 
         return log_probs, entropys
 
-    def update_policy(self, data: DataProto):
+    def update_policy(self, data: DataProto, data_second: DataProto = None):
         # make sure we are in training mode
         self.actor_module.train()
 
@@ -292,7 +292,30 @@ class DataParallelPPOActor(BasePPOActor):
             non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
         else:
+            num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             dataloader = batch.split(self.config.ppo_mini_batch_size)
+
+        # ==========================================================
+        # Stage 2 Setup: Group by UID and split evenly across mini-batches
+        # ==========================================================
+        verification_mini_batches = [[] for _ in range(max(1, num_mini_batches))]
+        lambda_second = self.config.get("lambda_second", 0.5)
+
+        if data_second is not None:
+            # Group Stage 2 samples by UID (same prompt & candidate)
+            uids = data_second.non_tensor_batch.get("uid", None)
+            if uids is not None:
+                unique_uids = list(set(uids))
+                verification_groups = []
+                for uid in unique_uids:
+                    mask = np.array([u == uid for u in uids])
+                    group_data = data_second[np.where(mask)[0].tolist()]
+                    group_batch = group_data.select(batch_keys=select_keys).batch
+                    verification_groups.append(group_batch)
+                
+                # Distribute groups evenly into verification_mini_batches
+                for i, group in enumerate(verification_groups):
+                    verification_mini_batches[i % max(1, num_mini_batches)].append(group)
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -405,11 +428,54 @@ class DataParallelPPOActor(BasePPOActor):
                             k_th_log_prob = topk[:, :, k_idx]  # (bsz, response_length)
                             avg_kth = (k_th_log_prob * response_mask).sum() / response_mask.sum().clamp(min=1)
                             data[f"actor/topk_logprob_k{k_idx+1}"] = avg_kth.detach().item()
-                        # Explicitly release topk tensor to free GPU memory
+                    # Explicitly release topk tensor to free GPU memory
                         del topk
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
                     append_to_dict(metrics, data)
+
+                # ==========================================================
+                # Stage 2 Backward Pass (for this mini-batch)
+                # ==========================================================
+                current_v_groups = verification_mini_batches[batch_idx] if batch_idx < len(verification_mini_batches) else []
+                if current_v_groups:
+                    num_groups = len(current_v_groups)
+                    group_losses = []
+                    
+                    for group_batch in current_v_groups:
+                        # Split group into micro-batches to avoid OOM
+                        group_micro_batches = group_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                        num_group_mbs = len(group_micro_batches)
+                        
+                        for mb_s in group_micro_batches:
+                            mb_s = mb_s.to(torch.cuda.current_device())
+                            response_mask_s = mb_s["attention_mask"][:, -mb_s["responses"].size(1):]
+                            
+                            _, log_prob_s, _ = self._forward_micro_batch(
+                                micro_batch=mb_s, temperature=temperature, calculate_entropy=False, compute_topk=False
+                            )
+                            
+                            # GRPO loss is just pg_loss since we already computed advantages based on group 
+                            pg_loss_s, _, _, _ = compute_policy_loss(
+                                old_log_prob=mb_s["old_log_probs"],
+                                log_prob=log_prob_s,
+                                advantages=mb_s["advantages"],
+                                response_mask=response_mask_s,
+                                cliprange=self.config.clip_ratio,
+                                cliprange_low=self.config.get("clip_ratio_low", self.config.clip_ratio),
+                                cliprange_high=self.config.get("clip_ratio_high", self.config.clip_ratio),
+                                clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+                                loss_agg_mode=self.config.loss_agg_mode,
+                            )
+                            
+                            # group_loss = mean over micro-batches. total_loss = mean over groups.
+                            # So loss_s = pg_loss_s / (num_groups * num_group_mbs)
+                            # lambda_second is already multiplied into advantages inside ray_trainer.py!
+                            loss_s = pg_loss_s / (num_groups * num_group_mbs)
+                            loss_s.backward()
+                            group_losses.append(pg_loss_s.detach().item())
+                            
+                    metrics["actor/second_stage_loss"] = sum(group_losses) / len(group_losses)
 
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
