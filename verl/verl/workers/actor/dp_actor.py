@@ -311,7 +311,9 @@ class DataParallelPPOActor(BasePPOActor):
                 for uid in unique_uids:
                     mask = np.array([u == uid for u in uids])
                     group_data = data_second[np.where(mask)[0].tolist()]
-                    group_batch = group_data.select(batch_keys=select_keys).batch
+                    # Filter keys that exist in both select_keys and group_data.batch
+                    available_keys = [k for k in select_keys if k in group_data.batch.keys()]
+                    group_batch = group_data.select(batch_keys=available_keys).batch
                     verification_groups.append(group_batch)
                 
                 # Distribute groups evenly into verification_mini_batches

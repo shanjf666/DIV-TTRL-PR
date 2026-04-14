@@ -60,3 +60,16 @@
 - 修改每次请求执行从最高票中选定的 candidate 验证数配置：`+two_stage_n=8`（原 -1）。
 - 修改需要验证的 candidate 回答样本候选数配置：`+two_stage_max_candidates=5`（原 -1）。
 - 新增增加学习率系数缩放：`+algorithm.lambda_second=0.5`。
+
+## 6. 已知问题与修复记录
+
+在实现过程中发现并修复了以下两个关键 Bug，以确保在大规模分布式训练下系统的稳定性：
+
+### 6.1 Numpy 命名空间错误 (NameError)
+- **现象**：在 `dp_actor.py` 中执行 UID 分组逻辑时报错 `name 'np' is not defined`。
+- **修复**：在 `verl/workers/actor/dp_actor.py` 顶层添加了 `import numpy as np`。
+
+### 6.2 训练关键词缺失 (KeyError: 'ref_log_prob')
+- **现象**：当第一阶段开启 KL 散度约束时，底层 `DataProto.select` 会强制要求所有数据批次（包含第二阶段数据）都必须拥有 `ref_log_prob` 字段。由于 Verifier 的 Rollouts 并没有计算该字段，导致训练中断。
+- **修复**：在 `dp_actor.py` 的 `update_policy` 函数中引入了**动态键值过滤机制**。它会自动检测当前 `DataProto` 实际拥有的 Key，确保护理第二阶段数据时不再强行索取不存在的 KL 相关字段，从而支持 Generator 有 KL 约束而 Verifier 无 KL 约束的异构训练模式。
+
