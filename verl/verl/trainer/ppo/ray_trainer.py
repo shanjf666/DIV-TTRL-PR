@@ -1021,7 +1021,7 @@ class RayPPOTrainer:
             extract_candidate_answers,
             construct_verification_dataproto,
             decode_verification_outputs,
-            resolve_filtered_pseudo_labels,
+            select_final_pseudo_labels,
         )
         from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 
@@ -1045,18 +1045,11 @@ class RayPPOTrainer:
             max_candidates=self.two_stage_max_candidates,
         )
 
-        groups_to_verify = []
-        for g in prompt_groups:
-            if g.get("majority_rate", 1.0) < 0.3:
-                groups_to_verify.append(g)
+        groups_to_verify = prompt_groups
 
-        metrics["train/two_stage_trigger_rate"] = len(groups_to_verify) / len(prompt_groups) if prompt_groups else 0.0
+        metrics["train/two_stage_trigger_rate"] = 1.0 if prompt_groups else 0.0
         avg_majority_rate = sum(g.get("majority_rate", 0.0) for g in prompt_groups) / len(prompt_groups) if prompt_groups else 0.0
         metrics["train/two_stage_majority_rate_mean"] = avg_majority_rate
-
-        if not groups_to_verify:
-            print("[TwoStage] All prompt groups skipped verification due to majority >= 0.3")
-            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], []
 
         total_candidates = sum(len(g["candidates"]) for g in groups_to_verify)
         print(f"[TwoStage] Triggered verification for {len(groups_to_verify)}/{len(prompt_groups)} prompt groups")
@@ -1100,24 +1093,56 @@ class RayPPOTrainer:
         # Free VRAM before verification generation
         torch.cuda.empty_cache()
 
-        # Step 4: Micro-batched verification generation
-        # Determine micro-batch size
+        # Step 4: Token-aware micro-batched verification generation
+        # Instead of fixed sample count, use rearrange_micro_batches to balance by token count
+        from verl.utils.seqlen_balancing import rearrange_micro_batches
+        
+        # Calculate target chunk token budget based on micro_batch_size
+        max_prompt_len = self.config.data.max_prompt_length * 2
+        max_token_len = max_prompt_len + self.two_stage_max_new_tokens
+        
         if self.two_stage_micro_batch_size > 0:
             micro_bs = self.two_stage_micro_batch_size
         else:
             # Auto: use the same size as the original train batch size
             micro_bs = max(4, self.config.data.train_batch_size)
+        
+        # Target chunk: sufficient tokens for approximately micro_bs samples
+        target_chunk_tokens = max_token_len * micro_bs
+        
+        micro_batches, micro_bsz_idx = rearrange_micro_batches(
+            batch=verification_batch.batch,
+            max_token_len=target_chunk_tokens,
+            dp_group=None
+        )
 
         total_verification_size = len(verification_batch)
+        n_samples = verification_batch.meta_info.get("verification_n", 1)
         all_verification_outputs = []
         all_chunk_outputs = []
+        
+        # Track out-of-order outputs since rearrange_micro_batches reorders indices
+        # output_by_orig_idx[i] = list of n_samples responses (or fewer if error)
+        outputs_by_orig_idx = {}
+        
+        # Reorder indices for batch_second reassembly
+        current_unordered_offset = 0
+        reorder_indices = [0] * (total_verification_size * n_samples)
 
-        print(f"[TwoStage] Running verification inference: {total_verification_size} samples, "
-              f"micro_batch_size={micro_bs}")
+        print(f"[TwoStage] Running verification inference: {total_verification_size} samples "
+              f"distributed into {len(micro_batches)} token-balanced chunks (max_token_len={target_chunk_tokens}).")
 
-        for chunk_start in range(0, total_verification_size, micro_bs):
-            chunk_end = min(chunk_start + micro_bs, total_verification_size)
-            chunk = verification_batch[chunk_start:chunk_end]
+        for chunk_idx, (micro_batch_tensors, indices) in enumerate(zip(micro_batches, micro_bsz_idx)):
+            # Slice non_tensor_batch according to the shuffled indices
+            nt_batch = None
+            if verification_batch.non_tensor_batch is not None:
+                nt_batch = {}
+                for k, v in verification_batch.non_tensor_batch.items():
+                    nt_batch[k] = v[indices]
+            
+            # Construct chunk DataProto with correctly sliced data
+            chunk = DataProto(batch=micro_batch_tensors, non_tensor_batch=nt_batch, 
+                            meta_info=verification_batch.meta_info.copy())
 
             # Pad to be divisible by dp_size
             chunk_padded, pad_size = pad_dataproto_to_divisor(chunk, self.actor_rollout_wg.world_size)
@@ -1128,75 +1153,113 @@ class RayPPOTrainer:
 
                 # Decode verification responses
                 chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
-                all_verification_outputs.extend(chunk_decoded)
                 
-                # Keep the original output for Stage 2 training (move to CPU to save VRAM)
+                # Distribute responses back to outputs_by_orig_idx
+                # Each original index i in indices will have n_samples responses
+                for i, orig_idx in enumerate(indices):
+                    resp_start = i * n_samples
+                    resp_end = resp_start + n_samples
+                    outputs_by_orig_idx[orig_idx] = chunk_decoded[resp_start:resp_end]
+                    
+                    # Track reordering indices for batch_second
+                    for j in range(n_samples):
+                        reorder_indices[orig_idx * n_samples + j] = current_unordered_offset + i * n_samples + j
+                
+                current_unordered_offset += len(indices) * n_samples
                 all_chunk_outputs.append(chunk_output.to("cpu"))
+                
             except Exception as e:
-                print(f"[TwoStage] Error during verification chunk {chunk_start}-{chunk_end}: {e}")
-                # Fill with empty strings for this chunk
-                all_verification_outputs.extend([""] * (chunk_end - chunk_start))
-                # For chunk_output, if it fails we can't really do much. We might just append the verification prompts and empty response
-                # But it's safer to just skip training on failed chunks. However, mapping will be misaligned if we skip `all_chunk_outputs`.
-                # To keep it simple, raising or skipping is problematic. The original code extended with empty string.
-                # If we don't have block we might crash later.
-                # Note: failure in generate_sequences shouldn't happen unless OOM.
+                print(f"[TwoStage] Error during verification chunk {chunk_idx}: {e}")
+                # Fill with empty responses on error
+                for orig_idx in indices:
+                    outputs_by_orig_idx[orig_idx] = [""] * n_samples
             finally:
-                # Cleanup per chunk
+                # Cleanup per chunk (but NOT empty_cache, to avoid stalling)
                 if 'chunk_output_padded' in locals():
                     del chunk_output_padded
                 if 'chunk_output' in locals():
                     del chunk_output
                 if 'chunk_padded' in locals():
                     del chunk_padded
-                gc.collect()
-                torch.cuda.empty_cache()
+
+        # Final cleanup after all chunks
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Reassemble outputs in original order
+        for orig_idx in range(total_verification_size):
+            resps = outputs_by_orig_idx.get(orig_idx, [""] * n_samples)
+            # Ensure we always have exactly n_samples entries
+            if len(resps) < n_samples:
+                resps = resps + [""] * (n_samples - len(resps))
+            all_verification_outputs.extend(resps)
 
         print(f"[TwoStage] Decoded {len(all_verification_outputs)} verification outputs")
         
         # Combine all chunk outputs into batch_second
         if len(all_chunk_outputs) > 0:
-            batch_second = DataProto.concat(all_chunk_outputs)
+            batch_second_unordered = DataProto.concat(all_chunk_outputs)
             
-            # Setup UIDs for GRPO grouping
-            # All samples for the same prompt & candidate share a UID
-            # mapping contains prompt_group_idx and candidate_answer
-            uids = []
-            for m in verification_mapping:
-                uid = f"verify_group_{m['prompt_group_idx']}_{m['candidate_answer']}"
-                uids.append(uid)
-            batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
+            # Check if all chunks were processed successfully
+            has_error = current_unordered_offset < total_verification_size * n_samples
+            if not has_error and len(reorder_indices) > 0:
+                # Reorder batch_second to match original verification_mapping order
+                batch_second = batch_second_unordered[reorder_indices]
+                
+                # Setup UIDs for GRPO grouping (now in correct order)
+                # All samples for the same prompt & candidate share a UID
+                uids = []
+                for m in verification_mapping:
+                    uid = f"verify_group_{m['prompt_group_idx']}_{m['candidate_answer']}"
+                    uids.append(uid)
+                batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
+            else:
+                print("[TwoStage] Warning: Dropped chunks detected. Discarding batch_second to prevent mapping corruption.")
+                batch_second = None
         else:
             batch_second = None
 
         # Step 5: Resolve pseudo-labels
-        verified_labels, verified_consistencies = resolve_filtered_pseudo_labels(
+        verified_labels, verified_consistencies, should_update_flags = select_final_pseudo_labels(
             verification_outputs=all_verification_outputs,
             verification_mapping=verification_mapping,
             prompt_groups=groups_to_verify,
+            n_votes_per_prompt=self.n_votes_per_prompt,
+            high_consistency_threshold=0.5,
+            low_consistency_strategy="true",
+            fallback_mode="no_update_second",
         )
 
         from verl.utils.reward_score.ttrl.two_stage_utils import parse_verification_result
-        
-        # Merge back with skipped groups
-        final_pseudo_labels = []
-        final_consistencies = []
-        verified_idx = 0
-        success_filter_count = 0
-        for g in prompt_groups:
-            if g.get("majority_rate", 1.0) < 0.3:
-                resolved_label = verified_labels[verified_idx]
-                resolved_cons = verified_consistencies[verified_idx]
-                final_pseudo_labels.append(resolved_label)
-                final_consistencies.append(resolved_cons)
-                if resolved_label != g.get("majority_answer"):
-                     success_filter_count += 1
-                verified_idx += 1
-            else:
-                final_pseudo_labels.append(g.get("majority_answer"))
-                final_consistencies.append(g.get("majority_rate", 0.0))
 
+        # Filter batch_second and verification data for Stage2 training
+        if batch_second is not None and len(batch_second) > 0:
+            keep_indices = []
+            for i, m in enumerate(verification_mapping):
+                g_idx = m["prompt_group_idx"]
+                if should_update_flags[g_idx]:
+                    keep_indices.append(i)
+
+            if keep_indices:
+                batch_second = batch_second[keep_indices]
+                verification_mapping = [verification_mapping[i] for i in keep_indices]
+                all_verification_outputs = [all_verification_outputs[i] for i in keep_indices]
+            else:
+                batch_second = None
+                verification_mapping = []
+                all_verification_outputs = []
+                print("[TwoStage] All samples skipped Stage2 training due to no valid low-consistency candidates")
+
+        final_pseudo_labels = verified_labels
+        final_consistencies = verified_consistencies
+
+        # Count how many samples were filtered to a different pseudo-label
+        success_filter_count = 0
         if len(groups_to_verify) > 0:
+            success_filter_count = sum(
+                1 for i, g in enumerate(groups_to_verify)
+                if verified_labels[i] != g.get("majority_answer")
+            )
             metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
         else:
             metrics["train/two_stage_filtered_ratio"] = 0.0
@@ -1370,18 +1433,34 @@ class RayPPOTrainer:
                                 }
                                 
                                 # Calculate GT correctness for candidates
-                                from verl.utils.reward_score.math_verify import compute_score
+                                from verl.utils.reward_score.ttrl.qwen.qwen_math_parser import math_equal, extract_answer
                                 gt_correct_scores = []
                                 for m in verify_mapping:
                                     g_idx = m["prompt_group_idx"]
                                     cand = m["candidate_answer"]
-                                    gt = ""
+                                    gt_raw = ""
                                     for g in groups_to_verify:
                                         if g["prompt_group_idx"] == g_idx:
-                                            gt = g.get("ground_truth", "")
+                                            gt_raw = g.get("ground_truth", "")
                                             break
-                                    # evaluate GT truth
-                                    is_correct = compute_score(cand, gt) > 0.0 if gt else False
+                                    
+                                    if not gt_raw:
+                                        is_correct = False
+                                    else:
+                                        # Ensure both are strings
+                                        gt_str = str(gt_raw)
+                                        cand_str = str(cand)
+                                        
+                                        # Robust extraction for GT as well (it might be boxed)
+                                        # We use "math" as the data_name for the parser
+                                        gt_extracted = extract_answer(gt_str, data_name="math")
+                                        if not gt_extracted:
+                                            # Fallback to raw if extraction fails (might already be raw)
+                                            gt_extracted = gt_str
+                                        
+                                        # Final comparison using math_equal
+                                        is_correct = math_equal(cand_str, gt_extracted)
+                                        
                                     gt_correct_scores.append(is_correct)
 
                                 rewards, cm_metrics = compute_proxy_cm_reward(

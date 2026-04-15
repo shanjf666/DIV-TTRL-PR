@@ -151,7 +151,10 @@ def extract_candidate_answers(
         ground_truth = ""
         if group_extra_info and group_extra_info[0]:
             gt_info = group_extra_info[0].get("reward_model", {})
-            ground_truth = gt_info.get("ground_truth", group_extra_info[0].get("ground_truth", group_extra_info[0].get("answer", "")))
+            ground_truth = gt_info.get("ground_truth", 
+                                      group_extra_info[0].get("ground_truth", 
+                                                              group_extra_info[0].get("answer", 
+                                                                                      group_extra_info[0].get("target", ""))))
 
         prompt_groups.append({
             "problem_text": problem_text,
@@ -258,15 +261,19 @@ def construct_verification_dataproto(
             token_ids = encoded["input_ids"]
             attention_mask = encoded["attention_mask"]
 
-            # In sampling mode, repeat for verification_n samples.
-            # If verification_n is None or < 0, dynamically use candidate frequency.
-            if verification_mode == "sampling":
-                if verification_n is None or verification_n < 0:
-                    repeat_count = frequency
-                else:
-                    repeat_count = verification_n
+            # Strategy for sampling:
+            # - If verification_n is NOT None and >= 0: use native engine n-sampling (no Python duplication)
+            # - If verification_n is None or < 0: fallback to dynamic frequency-based duplication
+            # This reduces Python-layer overhead and lets vLLM handle multi-sampling natively.
+            
+            if verification_mode == "sampling" and (verification_n is None or verification_n < 0):
+                # Dynamic frequency-based duplication (legacy fallback)
+                repeat_count = frequency
+                native_n_sampling = 1
             else:
+                # Native engine sampling: no Python duplication
                 repeat_count = 1
+                native_n_sampling = verification_n if verification_mode == "sampling" and verification_n is not None else 1
                 
             for _ in range(repeat_count):
                 all_token_ids.append(token_ids)
@@ -275,6 +282,7 @@ def construct_verification_dataproto(
                     "prompt_group_idx": prompt_group_idx,
                     "candidate_answer": candidate_answer,
                     "frequency": frequency,
+                    "native_n_sampling": native_n_sampling,  # Signal to engine how many samples to generate
                 })
 
     if not all_token_ids:
@@ -328,6 +336,10 @@ def construct_verification_dataproto(
         "verification_mode": verification_mode,
         "do_sample": verification_mode != "greedy",
         "validate": False,
+        # Pass verification_n to enable native engine sampling (when using non-dynamic frequency):
+        # - If verification_n is provided and >= 1: tell engine to generate n samples per prompt
+        # - If verification_n is None or < 0: engine will generate 1 sample (fallback to frequency duplication)
+        "verification_n": max(1, verification_n) if verification_mode == "sampling" and verification_n is not None and verification_n > 0 else 1,
     }
 
     verification_batch = DataProto(
@@ -364,96 +376,94 @@ def parse_verification_result(text: str) -> Optional[bool]:
         
     return None
 
-def resolve_filtered_pseudo_labels(
+def select_final_pseudo_labels(
     verification_outputs: List[str],
     verification_mapping: List[Dict],
     prompt_groups: List[Dict],
-) -> Tuple[List[Optional[str]], List[float]]:
-    """Match verification results back to prompt groups and resolve the best pseudo-label.
-    
-    Filters candidates based on majority vote (True_votes > False_votes).
-    If no candidate passes, falls back to the original majority answer from Pass 1.
+    n_votes_per_prompt: int = 8,
+    high_consistency_threshold: float = 0.5,
+    low_consistency_strategy: str = "true",
+    fallback_mode: str = "no_update_second",
+) -> Tuple[List[str], List[float], List[bool]]:
+    """Resolve the final pseudo-labels and decide Stage2 participation.
+
+    High-consistency groups directly keep the majority answer.
+    Low-consistency groups use verification True/False statistics to choose a candidate.
 
     Args:
-        verification_outputs: List of decoded verification response strings.
+        verification_outputs: List of decoded verification result strings.
         verification_mapping: The mapping list from construct_verification_dataproto().
-        prompt_groups: Output of extract_candidate_answers(), contains fallback info.
+        prompt_groups: Output of extract_candidate_answers().
+        n_votes_per_prompt: Number of Stage1 samples per prompt.
+        high_consistency_threshold: threshold for high-consistency groups.
+        low_consistency_strategy: "true" or "majority" selection strategy for low-consistency groups.
+        fallback_mode: "no_update_second" or "no_update_both" for low-consistency failures.
 
     Returns:
         Tuple of:
-            - List of length len(prompt_groups), each containing the selected pseudo-label answer.
-            - List of length len(prompt_groups), each containing the consistency score of the selected pseudo-label.
+            - final pseudo labels for each prompt group.
+            - consistency scores for each prompt group.
+            - whether each prompt group should participate in Stage2 training.
     """
     assert len(verification_outputs) == len(verification_mapping), (
         f"Mismatch: {len(verification_outputs)} outputs vs {len(verification_mapping)} mappings"
     )
 
     num_prompt_groups = len(prompt_groups)
-    
-    # Group results by prompt_group_idx
-    group_results: Dict[int, List[Dict]] = {}
+    group_stats: Dict[int, Dict[str, Dict[str, int]]] = {}
 
     for output_text, mapping in zip(verification_outputs, verification_mapping):
         group_idx = mapping["prompt_group_idx"]
-        if group_idx not in group_results:
-            group_results[group_idx] = []
-        is_true = parse_verification_result(output_text)
+        ans = mapping["candidate_answer"]
+        if group_idx not in group_stats:
+            group_stats[group_idx] = {}
+        if ans not in group_stats[group_idx]:
+            group_stats[group_idx][ans] = {"true_count": 0, "false_count": 0, "frequency": mapping["frequency"]}
 
-        group_results[group_idx].append({
-            "candidate_answer": mapping["candidate_answer"],
-            "frequency": mapping["frequency"],
-            "is_true": is_true,
-        })
+        parsed = parse_verification_result(output_text)
+        if parsed is True:
+            group_stats[group_idx][ans]["true_count"] += 1
+        elif parsed is False:
+            group_stats[group_idx][ans]["false_count"] += 1
 
-    pseudo_labels = [None] * num_prompt_groups
+    pseudo_labels = [""] * num_prompt_groups
     consistencies = [0.0] * num_prompt_groups
+    should_update_second = [False] * num_prompt_groups
 
     for i, group in enumerate(prompt_groups):
         group_idx = group["prompt_group_idx"]
-        results = group_results.get(group_idx, [])
-        original_majority_ans = group.get("majority_answer")
-        
-        if not results:
-            pseudo_labels[i] = original_majority_ans
-            continue
-            
-        candidate_scores: Dict[str, Dict] = {}
-        for r in results:
-            ans = r["candidate_answer"]
-            if ans not in candidate_scores:
-                candidate_scores[ans] = {
-                    "frequency": r["frequency"],
-                    "true_count": 0,
-                    "false_count": 0
-                }
-            if r["is_true"] is True:
-                candidate_scores[ans]["true_count"] += 1
-            elif r["is_true"] is False:
-                candidate_scores[ans]["false_count"] += 1
-                
-        # All candidates sorted by true_count (desc), then frequency (desc)
-        all_candidates = [(ans, info["true_count"], info["frequency"]) for ans, info in candidate_scores.items()]
-        all_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
-                
-        if all_candidates and all_candidates[0][1] > 0:
-            # Pick the one with the highest true_count
-            pseudo_labels[i] = all_candidates[0][0]
-            # Consistency is frequency / total votes
-            # wait, n_votes_per_prompt is not passed directly, but majority_rate is frequency / n_votes.
-            # freq = all_candidates[0][2]
-            # Since majority_rate = cand[0][1] / N, we can calculate N = cand[0][1] / majority_rate
-            # But the simplest is to find the overall candidate freq within the group
-            freq = all_candidates[0][2]
-            top_freq = group["candidates"][0][1] if group["candidates"] else 1
-            majority_rate = group.get("majority_rate", 0.0)
-            n_votes = top_freq / majority_rate if majority_rate > 0 else 1
-            consistencies[i] = freq / n_votes
-        else:
-            # Fallback: direct majority from Pass 1 if all true_counts are 0
-            pseudo_labels[i] = original_majority_ans
-            consistencies[i] = group.get("majority_rate", 0.0)
+        majority_rate = group.get("majority_rate", 0.0)
+        majority_answer = group.get("majority_answer")
 
-    return pseudo_labels, consistencies
+        if majority_rate >= high_consistency_threshold:
+            pseudo_labels[i] = majority_answer
+            consistencies[i] = majority_rate
+            should_update_second[i] = True
+            continue
+
+        candidate_stats = group_stats.get(group_idx, {})
+        true_set_candidates = [
+            (ans, info["true_count"], info["frequency"])
+            for ans, info in candidate_stats.items()
+            if info["true_count"] > info["false_count"]
+        ]
+
+        if true_set_candidates:
+            if low_consistency_strategy == "true":
+                true_set_candidates.sort(key=lambda x: (x[1], x[2]), reverse=True)
+            else:
+                true_set_candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)
+
+            best_ans, _, best_freq = true_set_candidates[0]
+            pseudo_labels[i] = best_ans
+            consistencies[i] = best_freq / max(1, n_votes_per_prompt)
+            should_update_second[i] = True
+        else:
+            pseudo_labels[i] = majority_answer
+            consistencies[i] = majority_rate
+            should_update_second[i] = (fallback_mode != "no_update_both")
+
+    return pseudo_labels, consistencies, should_update_second
 
 def compute_proxy_cm_reward(
     verification_outputs: List[str],
@@ -537,12 +547,12 @@ def compute_proxy_cm_reward(
         elif not is_pl and parsed_result is False: # TN
             rewards.append(1.0 * consistency)
             tn_count += 1
-        elif not is_pl and parsed_result is True:  # FP
-            rewards.append(-1.0 * consistency)
-            fp_count += 1
         elif is_pl and parsed_result is False:   # FN
-            rewards.append(-0.5 * consistency)
+            rewards.append(-1.0 * consistency)
             fn_count += 1
+        elif not is_pl and parsed_result is True:  # FP
+            rewards.append(-0.5 * consistency)
+            fp_count += 1
             
     metrics = {
         "tp_rate": tp_count / total if total > 0 else 0.0,
@@ -575,12 +585,18 @@ def decode_verification_outputs(
 ) -> List[str]:
     """Decode the generated verification responses back to strings.
 
+    Handles both single-response and multi-response (native n-sampling) cases:
+    - Single response: batch_size outputs
+    - Native n-sampling: batch_size * n outputs (flattened by engine)
+
     Args:
         verification_gen_output: DataProto output from generate_sequences().
+                                Can be of size batch_size (greedy/single sample)
+                                or batch_size * n (native n-sampling).
         tokenizer: HuggingFace tokenizer.
 
     Returns:
-        List of decoded response strings.
+        List of decoded response strings (length = batch_size or batch_size*n).
     """
     decoded_texts = []
     batch_size = len(verification_gen_output)

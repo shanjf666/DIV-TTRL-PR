@@ -81,7 +81,12 @@
 ### 6.4 分布式占位数据切分错误 (AssertionError)
 - **现象**：当没有任何问题触发第二阶段验证时（`batch_second` 为空），系统抛出 `AssertionError: only support equal chunk. Got size of DataProto 1 and chunk 8`。
 - **原因**：分布式通信装饰器（Ray Dispatcher）要求输入的 DataProto 必须能被 GPU 数量（`world_size`）整除。原先使用的 `batch[:1]` 占位符无法平分给 8 张显卡。
-- **修复**：在 `ray_trainer.py` 中将占位数据的长度动态对齐为当前 `world_size`（即 `batch[:self.actor_rollout_wg.world_size]`）。这样每张显卡分得 1 条数据，满足了框架的切分要求；同时配合 `has_second_stage=False` 标记，确保底层 Worker 依然会跳过所有真实的损失计算，不产生额外开销。
+- **修复**：在 `ray_trainer.py` 中将占位数据的长度动态对齐为当前 `world_size`（即 `batch[:self.actor_rollout_wg.world_size]`）。这样每张显卡分得 1 条数据，满足了框架切分要求；同时配合 `has_second_stage=False` 标记，确保底层 Worker 依然会跳过所有真实的损失计算，不产生额外开销。
+
+### 6.5 GT 指标全为零修复 (GT_TP/FN = 0)
+- **现象**：WandB 中 `train/gt_tp_rate` 和 `train/gt_fn_rate` 持续为 0，而 `tn` 和 `fp` 有值。
+- **原因**：原先使用的 `math_verify.compute_score` 会强制给 Ground Truth 加上 `\boxed{}`。如果数据集中的 GT 已经带了 `\boxed`，会导致双重嵌套而匹配失败。此外，该工具对已经预提取过的答案字符串兼容性较差。
+- **修复**：在 `ray_trainer.py` 中引入了更健壮的 `math_equal` 比较逻辑，并对 Ground Truth 执行了二次提取（Handling boxed/raw strings）。同时在 `two_stage_utils.py` 中增加了对 `target` 字段的兼容性提取，确保真值比对逻辑的稳健性。
 
 ## 7. 验证性能监控增强 (Metrics V2)
 
