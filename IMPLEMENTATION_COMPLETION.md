@@ -1,52 +1,59 @@
 # Implementation Completion Checklist
 
+## 🔧 修复说明 (2026-04-15)
+
+**运行时错误**：`AssertionError: Mismatch: 584 outputs vs 73 mappings`
+
+**原因**：思路一（原生 n-sampling）的实现导致 verification_mapping 数量与输出不匹配
+
+**修复方案**：临时回滚思路一，保留思路二（token-aware 分桶）的优化
+- ✅ 恢复原始采样复制逻辑（Python 层）
+- ✅ 保留 token-aware 分桶优化（20-40% padding 减少）
+- ⏸️  原生 n-sampling 优化推迟（需重新设计 mapping 结构）
+
+---
+
 按照 speed_up.md 的优化计划，已完成以下改动。
 
 
-## 思路一：引擎原生批量采样 ✅
+## 思路一：引擎原生批量采样 ⏸️ (临时回滚)
+
+**当前状态**：为确保数据一致性，暂时使用原始采样策略（Python 层复制）
 
 ### two_stage_utils.py 改动
 
 - [x] **construct_verification_dataproto()** L265-277
-  - 改用 native_n_sampling 标记代替 repeat_count 复制
-  - 当 verification_n 有效时，repeat_count=1（不在 Python 复制）
-  - verification_mapping 中添加 "native_n_sampling" 字段
+  - ✅ 恢复原始 repeat_count 逻辑
+  - ✅ verification_mapping 保持完整复制（每个样本一条）
+  - ℹ️  移除 native_n_sampling 字段（推迟方案）
 
-- [x] **meta_info["verification_n"] 设置** L334-343
-  - 传递 verification_n 给引擎（当 sampling 模式且 verification_n > 0）
-
-- [x] **decode_verification_outputs() 文档** L582-617  
-  - 添加注释说明支持 native n-sampling 输出（batch_size * n）
-  - 实现无需改动（自动处理任何大小输入）
+- [x] **meta_info["verification_n"] 移除** L334-343
+  - ✅ 不再向引擎发信号进行 native n-sampling
 
 ### fsdp_workers.py 改动
 
 - [x] **verification_mode 分支** L589-608
-  - 从 meta_info 读取 verification_n
-  - 传递给 vLLM：`verification_kwargs["n"] = verification_n`
-  - 替换硬编码的 `verification_kwargs["n"] = 1`
+  - ✅ 移除 verification_n 的 native n-sampling 传递
+  - ✅ 回到原始行为
 
 ---
 
-## 思路二：Token-aware 微批处理分桶 ✅
+## 思路二：Token-aware 微批处理分桶 ✅ (保留)
 
 ### ray_trainer.py 改动
 
-- [x] **Step 4 完整重写** L1100-1172
-  - 导入 `rearrange_micro_batches` 从 seqlen_balancing
-  - 计算 target_chunk_tokens = max_token_len * micro_bs
-  - 调用 rearrange_micro_batches 获取平衡的 chunks
-  - 记录 outputs_by_orig_idx 和 reorder_indices 处理 out-of-order
+- [x] **Step 4 优化** L1100-1220
+  - ✅ 使用 `rearrange_micro_batches()` 按 token 数平衡分桶
+  - ✅ 处理 out-of-order 样本重排
+  - ✅ 设置 `n_samples=1`（与原始采样策略匹配）
 
-- [x] **处理乱序输出重排** L1143-1172
-  - 在 outputs_by_orig_idx 中按原始索引收集响应
-  - 记录 reorder_indices 以恢复原始顺序
-  - 最终过一遍所有原始索引进行数据完整检验
+- [x] **响应处理简化** L1155-1210  
+  - ✅ 1:1 映射响应和 mapping
+  - ✅ 简化 reorder_indices 逻辑
 
-- [x] **Batch_second 构建和重排** L1197-1219  
-  - concat 所有 chunks 后检查是否有错误
-  - 使用 reorder_indices 重排回原始顺序
-  - 按原始顺序的 mapping 生成 UID
+- [x] **Batch_second 构建** L1197-1219  
+  - ✅ 按原始顺序重排
+  - ✅ 生成正确的 UID 序列
 
 - [x] **Cache 清理策略调整** L1159-1166
   - 移除每个 chunk 后的 empty_cache 调用

@@ -589,14 +589,14 @@ class ActorRolloutRefWorker(Worker):
                 verification_max_tokens = prompts.meta_info.get("verification_max_new_tokens", 512)
                 verification_kwargs = {"max_tokens": verification_max_tokens}
 
-                # For sampling mode verification, pass temperature, top_p, and native n-sampling
+                # For sampling mode verification, pass temperature and top_p
                 if verification_mode == "sampling":
                     verification_temp = prompts.meta_info.get("verification_temperature", 0.6)
                     verification_top_p = prompts.meta_info.get("verification_top_p", 1.0)
-                    verification_n = prompts.meta_info.get("verification_n", 1)  # Native multi-sampling per candidate
                     verification_kwargs["temperature"] = verification_temp
                     verification_kwargs["top_p"] = verification_top_p
-                    verification_kwargs["n"] = verification_n  # Enable native engine n-sampling
+                    verification_n = prompts.meta_info.get("verification_n", 1)
+                    verification_kwargs["n"] = verification_n  # Native multi-sampling
 
                 with self.rollout.update_sampling_params(**verification_kwargs):
                     output = self.rollout.generate_sequences(prompts=prompts)

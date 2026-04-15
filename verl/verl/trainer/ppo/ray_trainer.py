@@ -1093,22 +1093,31 @@ class RayPPOTrainer:
         # Free VRAM before verification generation
         torch.cuda.empty_cache()
 
-        # Step 4: Token-aware micro-batched verification generation
-        # Instead of fixed sample count, use rearrange_micro_batches to balance by token count
+        # Step 4: Micro-batched verification generation
+        # Use token-aware micro-batching via rearrange_micro_batches
         from verl.utils.seqlen_balancing import rearrange_micro_batches
         
-        # Calculate target chunk token budget based on micro_batch_size
+        # Calculate per-sample token budget
         max_prompt_len = self.config.data.max_prompt_length * 2
         max_token_len = max_prompt_len + self.two_stage_max_new_tokens
         
+        # Determine the desired chunk size (samples per chunk)
+        # Use user-configured two_stage_micro_batch_size, or default to training batch size
         if self.two_stage_micro_batch_size > 0:
             micro_bs = self.two_stage_micro_batch_size
         else:
-            # Auto: use the same size as the original train batch size
             micro_bs = max(4, self.config.data.train_batch_size)
         
-        # Target chunk: sufficient tokens for approximately micro_bs samples
-        target_chunk_tokens = max_token_len * micro_bs
+        # Calculate target chunk token capacity
+        # We want each chunk to comfortably fit ~micro_bs samples
+        # Add a safety factor to account for overhead (position_ids, attention_mask, etc.)
+        safety_factor = 1.2
+        target_chunk_tokens = int(micro_bs * max_token_len * safety_factor)
+        
+        # Clamp to reasonable bounds (avoid too small or too large chunks)
+        # Lower bound: 20K tokens (prevents excessive fragmentation)
+        # Upper bound: 128K tokens (prevents OOM on typical GPUs)
+        target_chunk_tokens = max(20480, min(target_chunk_tokens, 131072))
         
         micro_batches, micro_bsz_idx = rearrange_micro_batches(
             batch=verification_batch.batch,
@@ -1121,28 +1130,29 @@ class RayPPOTrainer:
         all_verification_outputs = []
         all_chunk_outputs = []
         
-        # Track out-of-order outputs since rearrange_micro_batches reorders indices
-        # output_by_orig_idx[i] = list of n_samples responses (or fewer if error)
-        outputs_by_orig_idx = {}
-        
-        # Reorder indices for batch_second reassembly
+        # When n_samples > 1 (native vLLM n-sampling):
+        # - verification_batch has 73 rows (candidates)
+        # - verification_mapping has 73 * n_samples = 584 rows (one per sample)
+        # - vLLM output will be 73 * n_samples = 584 rows (one per generated sample)
+        # 
+        # We collect outputs row-by-row in order, matching verification_mapping
+        outputs_by_orig_idx = {}  # Maps verification_batch[orig_idx] -> list of n_samples responses
         current_unordered_offset = 0
         reorder_indices = [0] * (total_verification_size * n_samples)
 
-        print(f"[TwoStage] Running verification inference: {total_verification_size} samples "
+        print(f"[TwoStage] Running verification inference: {total_verification_size} samples (×{n_samples} native samples) "
               f"distributed into {len(micro_batches)} token-balanced chunks (max_token_len={target_chunk_tokens}).")
 
         for chunk_idx, (micro_batch_tensors, indices) in enumerate(zip(micro_batches, micro_bsz_idx)):
-            # Slice non_tensor_batch according to the shuffled indices
+            # The non_tensor_batch contains raw_prompt_ids, which we must correctly slice
             nt_batch = None
             if verification_batch.non_tensor_batch is not None:
                 nt_batch = {}
                 for k, v in verification_batch.non_tensor_batch.items():
                     nt_batch[k] = v[indices]
-            
-            # Construct chunk DataProto with correctly sliced data
-            chunk = DataProto(batch=micro_batch_tensors, non_tensor_batch=nt_batch, 
-                            meta_info=verification_batch.meta_info.copy())
+                    
+            # Construct a DataProto slice manually
+            chunk = DataProto(batch=micro_batch_tensors, non_tensor_batch=nt_batch, meta_info=verification_batch.meta_info.copy())
 
             # Pad to be divisible by dp_size
             chunk_padded, pad_size = pad_dataproto_to_divisor(chunk, self.actor_rollout_wg.world_size)
@@ -1154,42 +1164,42 @@ class RayPPOTrainer:
                 # Decode verification responses
                 chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
                 
-                # Distribute responses back to outputs_by_orig_idx
-                # Each original index i in indices will have n_samples responses
+                # chunk_output has length `len(indices) * n_samples`
+                # Collect responses by original sample index
                 for i, orig_idx in enumerate(indices):
                     resp_start = i * n_samples
                     resp_end = resp_start + n_samples
                     outputs_by_orig_idx[orig_idx] = chunk_decoded[resp_start:resp_end]
                     
-                    # Track reordering indices for batch_second
+                    # Track reorder indices for batch_second reassembly
                     for j in range(n_samples):
-                        reorder_indices[orig_idx * n_samples + j] = current_unordered_offset + i * n_samples + j
+                        reorder_indices[orig_idx * n_samples + j] = current_unordered_offset + resp_start + j
                 
                 current_unordered_offset += len(indices) * n_samples
                 all_chunk_outputs.append(chunk_output.to("cpu"))
-                
             except Exception as e:
                 print(f"[TwoStage] Error during verification chunk {chunk_idx}: {e}")
-                # Fill with empty responses on error
+                # Fill with empty strings on error
                 for orig_idx in indices:
                     outputs_by_orig_idx[orig_idx] = [""] * n_samples
             finally:
-                # Cleanup per chunk (but NOT empty_cache, to avoid stalling)
+                # Cleanup per chunk
                 if 'chunk_output_padded' in locals():
                     del chunk_output_padded
                 if 'chunk_output' in locals():
                     del chunk_output
                 if 'chunk_padded' in locals():
                     del chunk_padded
-
-        # Final cleanup after all chunks
+                # We NO LONGER empty_cache after every chunk to prevent stalling
+        
+        # Final GC flush after all chunks
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Reassemble outputs in original order
+        # Reassemble flat outputs exactly matching the original DataProto order
         for orig_idx in range(total_verification_size):
             resps = outputs_by_orig_idx.get(orig_idx, [""] * n_samples)
-            # Ensure we always have exactly n_samples entries
+            # Ensure we always extend by exactly n_samples, even if chunk failed badly
             if len(resps) < n_samples:
                 resps = resps + [""] * (n_samples - len(resps))
             all_verification_outputs.extend(resps)
@@ -1200,13 +1210,12 @@ class RayPPOTrainer:
         if len(all_chunk_outputs) > 0:
             batch_second_unordered = DataProto.concat(all_chunk_outputs)
             
-            # Check if all chunks were processed successfully
             has_error = current_unordered_offset < total_verification_size * n_samples
-            if not has_error and len(reorder_indices) > 0:
+            if not has_error:
                 # Reorder batch_second to match original verification_mapping order
                 batch_second = batch_second_unordered[reorder_indices]
                 
-                # Setup UIDs for GRPO grouping (now in correct order)
+                # Setup UIDs for GRPO grouping
                 # All samples for the same prompt & candidate share a UID
                 uids = []
                 for m in verification_mapping:

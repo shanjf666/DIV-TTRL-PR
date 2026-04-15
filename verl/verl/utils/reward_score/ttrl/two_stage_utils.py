@@ -261,29 +261,31 @@ def construct_verification_dataproto(
             token_ids = encoded["input_ids"]
             attention_mask = encoded["attention_mask"]
 
-            # Strategy for sampling:
-            # - If verification_n is NOT None and >= 0: use native engine n-sampling (no Python duplication)
-            # - If verification_n is None or < 0: fallback to dynamic frequency-based duplication
-            # This reduces Python-layer overhead and lets vLLM handle multi-sampling natively.
-            
-            if verification_mode == "sampling" and (verification_n is None or verification_n < 0):
-                # Dynamic frequency-based duplication (legacy fallback)
-                repeat_count = frequency
-                native_n_sampling = 1
+            # In sampling mode, repeat for verification_n samples.
+            # If verification_n is None or < 0, dynamically use candidate frequency.
+            if verification_mode == "sampling":
+                if verification_n is None or verification_n < 0:
+                    repeat_count = frequency
+                    n_sampling = 1
+                else:
+                    # Enable native n-sampling in engine, no python dup
+                    repeat_count = 1
+                    n_sampling = verification_n
             else:
-                # Native engine sampling: no Python duplication
                 repeat_count = 1
-                native_n_sampling = verification_n if verification_mode == "sampling" and verification_n is not None else 1
+                n_sampling = 1
                 
             for _ in range(repeat_count):
                 all_token_ids.append(token_ids)
                 all_attention_masks.append(attention_mask)
-                verification_mapping.append({
-                    "prompt_group_idx": prompt_group_idx,
-                    "candidate_answer": candidate_answer,
-                    "frequency": frequency,
-                    "native_n_sampling": native_n_sampling,  # Signal to engine how many samples to generate
-                })
+                # Keep track of mapping for N samples
+                for _ in range(n_sampling):
+                    verification_mapping.append({
+                        "prompt_group_idx": prompt_group_idx,
+                        "candidate_answer": candidate_answer,
+                        "frequency": frequency,
+                        "n_sampling": n_sampling, # recorded to help matching if needed
+                    })
 
     if not all_token_ids:
         logger.warning("No valid candidates found for verification. Skipping Pass 2.")
@@ -336,10 +338,7 @@ def construct_verification_dataproto(
         "verification_mode": verification_mode,
         "do_sample": verification_mode != "greedy",
         "validate": False,
-        # Pass verification_n to enable native engine sampling (when using non-dynamic frequency):
-        # - If verification_n is provided and >= 1: tell engine to generate n samples per prompt
-        # - If verification_n is None or < 0: engine will generate 1 sample (fallback to frequency duplication)
-        "verification_n": max(1, verification_n) if verification_mode == "sampling" and verification_n is not None and verification_n > 0 else 1,
+        "verification_n": 1 if verification_mode != "sampling" or verification_n is None or verification_n < 0 else verification_n,
     }
 
     verification_batch = DataProto(
@@ -585,18 +584,12 @@ def decode_verification_outputs(
 ) -> List[str]:
     """Decode the generated verification responses back to strings.
 
-    Handles both single-response and multi-response (native n-sampling) cases:
-    - Single response: batch_size outputs
-    - Native n-sampling: batch_size * n outputs (flattened by engine)
-
     Args:
         verification_gen_output: DataProto output from generate_sequences().
-                                Can be of size batch_size (greedy/single sample)
-                                or batch_size * n (native n-sampling).
         tokenizer: HuggingFace tokenizer.
 
     Returns:
-        List of decoded response strings (length = batch_size or batch_size*n).
+        List of decoded response strings.
     """
     decoded_texts = []
     batch_size = len(verification_gen_output)
