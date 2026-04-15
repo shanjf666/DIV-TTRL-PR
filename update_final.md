@@ -79,8 +79,8 @@
   - 推荐 `"true"`，因为该策略更注重验证结果对候选的明确支持；`"majority"` 可用在验证结果本身不够稳定时。
 - `fallback_mode`:
   - 默认 `"no_update_second"`。
-  - `"no_update_second"`：当低一致性组没有候选满足 `true_count > false_count` 时，保留当前伪标签但不让该组进入 Stage2 训练。
-  - `"no_update_both"`：当低一致性失败时，避免该组进入 Stage2 训练，同时不将该组作为“可靠”二阶段更新样本。
+  - `"no_update_second"`：当低一致性组没有候选满足 `true_count > false_count` 时，保留当前伪标签，仅参与第一阶段更新，不进入 Stage2 训练。
+  - `"no_update_both"`：当低一致性失败时，同样不进入 Stage2 训练；当前实现下它与 `"no_update_second"` 在 Stage2 过滤行为一致。
   - 推荐先使用默认 `"no_update_second"`，这既保留伪标签决策，又避免不稳定样本伤害 Stage2 学习。
 
 ## 运行建议

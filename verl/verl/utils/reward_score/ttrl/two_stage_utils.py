@@ -383,7 +383,7 @@ def select_final_pseudo_labels(
     high_consistency_threshold: float = 0.5,
     low_consistency_strategy: str = "true",
     fallback_mode: str = "no_update_second",
-) -> Tuple[List[str], List[float], List[bool]]:
+) -> Tuple[List[str], List[float], List[bool], List[str]]:
     """Resolve the final pseudo-labels and decide Stage2 participation.
 
     High-consistency groups directly keep the majority answer.
@@ -403,6 +403,7 @@ def select_final_pseudo_labels(
             - final pseudo labels for each prompt group.
             - consistency scores for each prompt group.
             - whether each prompt group should participate in Stage2 training.
+            - route applied to each prompt group ("A", "B1", "B2").
     """
     assert len(verification_outputs) == len(verification_mapping), (
         f"Mismatch: {len(verification_outputs)} outputs vs {len(verification_mapping)} mappings"
@@ -428,6 +429,7 @@ def select_final_pseudo_labels(
     pseudo_labels = [""] * num_prompt_groups
     consistencies = [0.0] * num_prompt_groups
     should_update_second = [False] * num_prompt_groups
+    routes = [""] * num_prompt_groups
 
     for i, group in enumerate(prompt_groups):
         group_idx = group["prompt_group_idx"]
@@ -438,6 +440,7 @@ def select_final_pseudo_labels(
             pseudo_labels[i] = majority_answer
             consistencies[i] = majority_rate
             should_update_second[i] = True
+            routes[i] = "A"
             continue
 
         candidate_stats = group_stats.get(group_idx, {})
@@ -457,12 +460,16 @@ def select_final_pseudo_labels(
             pseudo_labels[i] = best_ans
             consistencies[i] = best_freq / max(1, n_votes_per_prompt)
             should_update_second[i] = True
+            routes[i] = "B1"
         else:
             pseudo_labels[i] = majority_answer
             consistencies[i] = majority_rate
-            should_update_second[i] = (fallback_mode != "no_update_both")
+            # Type C fallback samples should not enter Stage2 under both
+            # "no_update_second" and "no_update_both".
+            should_update_second[i] = fallback_mode not in {"no_update_second", "no_update_both"}
+            routes[i] = "B2"
 
-    return pseudo_labels, consistencies, should_update_second
+    return pseudo_labels, consistencies, should_update_second, routes
 
 def compute_proxy_cm_reward(
     verification_outputs: List[str],
@@ -559,6 +566,7 @@ def compute_proxy_cm_reward(
         "fp_rate": fp_count / total if total > 0 else 0.0,
         "fn_rate": fn_count / total if total > 0 else 0.0,
         "format_error_rate": format_error_count / total if total > 0 else 0.0,
+        "strictness_index": (fn_count + tn_count) / (fp_count + tp_count) if (fp_count + tp_count) > 0 else 0.0,
         "reward_mean": sum(rewards) / total if total > 0 else 0.0,
     }
 

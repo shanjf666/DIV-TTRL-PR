@@ -24,8 +24,8 @@
 high_consistency_threshold: float = 0.5  # 区分高低一致性的阈值
 low_consistency_strategy: str = "true"  # "true" 或 "majority"
 fallback_mode: str = "no_update_second"  # 低一致性选不出伪标签时的处理
-  - "no_update_second": 只用 majority_answer，不更新第二阶段
-  - "no_update_both": 直接跳过该样本的第二阶段更新，并可选保留/放弃第一阶段更新（由实现中的额外开关控制）
+    - "no_update_second": 只用 majority_answer，仅参与第一阶段更新，不更新第二阶段
+    - "no_update_both": 当前实现下同样跳过该样本的第二阶段更新
 ```
 
 #### 伪标签类型定义
@@ -107,7 +107,7 @@ for each prompt_group i in prompt_groups:
             # 选不出符合条件的，退回到 majority_answer
             pseudo_label[i] = group.majority_answer
             consistency[i] = majority_rate
-            should_update_second[i] = (fallback_mode != "no_update_both")
+            should_update_second[i] = fallback_mode not in {"no_update_second", "no_update_both"}
 ```
 
 #### 函数 B：修改 `compute_proxy_cm_reward()`

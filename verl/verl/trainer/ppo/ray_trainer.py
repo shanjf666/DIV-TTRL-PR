@@ -1229,7 +1229,7 @@ class RayPPOTrainer:
             batch_second = None
 
         # Step 5: Resolve pseudo-labels
-        verified_labels, verified_consistencies, should_update_flags = select_final_pseudo_labels(
+        verified_labels, verified_consistencies, should_update_flags, verified_routes = select_final_pseudo_labels(
             verification_outputs=all_verification_outputs,
             verification_mapping=verification_mapping,
             prompt_groups=groups_to_verify,
@@ -1264,14 +1264,51 @@ class RayPPOTrainer:
 
         # Count how many samples were filtered to a different pseudo-label
         success_filter_count = 0
+        flip_correct = 0
+        flip_incorrect = 0
+        route_b_count = 0
+
         if len(groups_to_verify) > 0:
-            success_filter_count = sum(
-                1 for i, g in enumerate(groups_to_verify)
-                if verified_labels[i] != g.get("majority_answer")
-            )
+            from verl.utils.reward_score.ttrl.qwen.qwen_math_parser import math_equal, extract_answer
+            
+            for i, g in enumerate(groups_to_verify):
+                if verified_labels[i] != g.get("majority_answer"):
+                    success_filter_count += 1
+                
+                # Check Route B flip logic for new metrics
+                if verified_routes[i] in ("B1", "B2"):
+                    route_b_count += 1
+                    if verified_labels[i] != g.get("majority_answer"):
+                        gt_raw = g.get("ground_truth", "")
+                        if gt_raw:
+                            gt_str = str(gt_raw)
+                            gt_ext = extract_answer(gt_str, data_name="math") or gt_str
+                            
+                            y_pseudo = str(verified_labels[i])
+                            y_maj = str(g.get("majority_answer"))
+                            
+                            is_pseudo_correct = math_equal(y_pseudo, gt_ext)
+                            is_maj_correct = math_equal(y_maj, gt_ext)
+                            
+                            if is_pseudo_correct and not is_maj_correct:
+                                flip_correct += 1
+                            elif not is_pseudo_correct and is_maj_correct:
+                                flip_incorrect += 1
+
             metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
+            
+            # New Metrics 1 & 2:
+            route_b_flips = sum(1 for i, g in enumerate(groups_to_verify) if verified_routes[i] in ("B1", "B2") and verified_labels[i] != g.get("majority_answer"))
+            metrics["train/two_stage_flip_rate"] = route_b_flips / max(1, route_b_count)
+            metrics["train/two_stage_net_correction_gain"] = float(flip_correct - flip_incorrect)
+            
+            route_b2_count = sum(1 for r in verified_routes if r == "B2")
+            metrics["train/two_stage_noise_mask_rate"] = route_b2_count / len(groups_to_verify)
         else:
             metrics["train/two_stage_filtered_ratio"] = 0.0
+            metrics["train/two_stage_flip_rate"] = 0.0
+            metrics["train/two_stage_net_correction_gain"] = 0.0
+            metrics["train/two_stage_noise_mask_rate"] = 0.0
 
         # Log verification-specific metrics
         true_count = sum(1 for out in all_verification_outputs if parse_verification_result(out) is True)

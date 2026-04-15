@@ -12,8 +12,8 @@
 ## 先给结论
 
 1. two-stage-verify 开启后，最容易误读的指标是 raw 的 label_accuracy 和 majority_voting_reward。它们已经不再只表示“多数票”的结果，而是表示“最终用于奖励的标签”对应的结果。
-2. train/tp_rate、train/tn_rate、train/fp_rate、train/fn_rate、train/gt_tp_rate、train/gt_tn_rate、train/gt_fp_rate、train/gt_fn_rate 这一组指标，在当前代码里是高风险项。它们在 [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1349) 先被初始化为 0.0，而 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L572) 又提供了一个同名但不同语义的 compute_proxy_cm_reward 实现，导致 trainer 的调用链和返回值 schema 不一致。
-3. 如果当前 step 没有任何 prompt group 触发验证，two-stage 相关的覆盖率指标显示为 0 是正常现象，不是 bug。真正需要重点排查的是“本该有验证却一直为 0”的场景，以及“指标名和计算对象不一致”的场景。
+2. train/tp_rate、train/tn_rate、train/fp_rate、train/fn_rate、train/format_error_rate、train/reward_mean、train/gt_tp_rate、train/gt_tn_rate、train/gt_fp_rate、train/gt_fn_rate 这一组指标，当前已经和 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L458) 的单一 compute_proxy_cm_reward 返回 schema 对齐，不再是“重复定义 / schema 冲突”问题。当前真正的问题是命名仍然过于泛化：它们看起来像普通训练指标，实际上是 two-stage 验证的 proxy confusion matrix 指标，而且在 [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1325) 里仍然先被初始化为 0.0，容易误读。
+3. 如果当前 step 没有任何 prompt group 触发验证，two-stage 相关的覆盖率指标显示为 0 是正常现象，不是 bug。train/tp_rate 这一组在没有触发 second stage 时保持 0 也只是占位值，不应当被解释成“验证结果真的全为 0”。
 
 ## Wandb 指标总览
 
@@ -30,6 +30,8 @@
 | majority_voting_reward | selected label 下的平均奖励 | 其实是“当前标签策略的平均奖励” | 成立，但 two-stage 时名字不再准确 |
 | pass@k | 至少有一个样本在 ground truth 下为正 | 组内存在正确候选答案 | 成立 |
 | neg_log_likelihood | 当前实现里实际由策略熵或类似 entropy 指标填充 | 训练策略的分布熵/不确定性 | 成立，但名字和物理量不完全一致 |
+
+说明：如果你说的 `reward_acc` 指的是代码里的 `reward_accuracy`，它在当前实现中就是 `rewards_hit_rate`。two-stage 开启时，它会跟随 `verified_label` 参与计算，因此逻辑上是正确的，但它表示的是“选定标签下的 reward 向量是否与 ground truth reward 向量一致”，不是分类准确率，也不是 reward 大小本身。
 
 补充说明：post_reward_accuracy、post_ground_truth_ratio、post_pass@k 这类字段只出现在 helper 函数 [ttt_metrics.py](verl/verl/utils/reward_score/ttrl/ttt_metrics.py#L79) 中，当前主训练链路并没有把它们作为 wandb 主指标常规写入。
 
@@ -69,11 +71,13 @@
 
 ### 4. 代理混淆矩阵指标
 
-这里是最容易出问题的部分。当前代码里，[ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1413) 会把二阶段样本送进 compute_proxy_cm_reward，再把返回值写入 wandb。
+这里是最容易被误读的部分。当前代码里，[ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1387) 会把二阶段样本送进 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L458) 的 compute_proxy_cm_reward，再把返回值写入 wandb。
 
-但是 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L458) 和 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L572) 里存在两个同名的 compute_proxy_cm_reward，两个版本的参数和返回 schema 不一致。前一个版本返回 tp_rate / gt_tp_rate 这类字段，后一个版本返回 proxy_cm/tp_rate 这类字段，并且会覆盖前一个定义。
+现在的 compute_proxy_cm_reward 只有一套实现，返回的 schema 也已经和 trainer 对齐：`tp_rate`、`tn_rate`、`fp_rate`、`fn_rate`、`format_error_rate`、`reward_mean`，以及可选的 `gt_tp_rate`、`gt_tn_rate`、`gt_fp_rate`、`gt_fn_rate`。也就是说，旧的“重复定义导致 schema 冲突”问题已经不在当前代码里了。
 
-这意味着当前两阶段混淆矩阵指标存在 schema 冲突，不能直接把它当成稳定可靠的统计结果。
+当前真正值得注意的是命名：这些值被写成 `train/...`，很容易被误认为是 actor 主训练指标，但它们实际上是 two-stage verifier 的 proxy confusion matrix 指标。若你想让看板更清晰，建议把这一组统一改成更明确的前缀，例如 `train/two_stage_proxy_cm/tp_rate`。
+
+补充一点：`gt_tp_rate`、`gt_tn_rate`、`gt_fp_rate`、`gt_fn_rate` 的计算逻辑本身是对的。它们使用的是 `parsed_result` 作为预测、`candidate_answer` 是否与 ground truth 等价作为真值，并且只对可解析的 verifier 输出计入分母，所以更像“在有效样本上的 GT proxy CM”而不是全量样本比例。如果你希望把格式失败也算进分母，需要额外改口径。
 
 ## two-stage 下哪些指标需要更换名字
 
@@ -86,32 +90,34 @@
 | majority_voting_reward | two-stage 时它并不一定来自多数票 | selected_label_reward_mean |
 | ground_truth_ratio | 实际上是 oracle reward mean / 正确率 | oracle_correct_rate 或 gt_reward_mean |
 | neg_log_likelihood | 实际更接近策略熵 | strategy_entropy |
-| tp_rate / tn_rate / fp_rate / fn_rate | 如果用于 two-stage verifier，它是代理混淆矩阵，不是普通分类 TP/TN | pseudo_cm_tp_rate 等更明确的名字 |
+| tp_rate / tn_rate / fp_rate / fn_rate / format_error_rate / reward_mean / gt_tp_rate / gt_tn_rate / gt_fp_rate / gt_fn_rate | 这是 two-stage verifier 的 proxy confusion matrix 指标，被放在 generic train namespace 里容易误读 | train/two_stage_proxy_cm/* 或 pseudo_cm/* 这一类更明确的名字 |
 
 其中最需要优先改的，是 majority_voting_reward 和 ground_truth_ratio。前者在 two-stage 里已经不再是“多数票奖励”，后者也不是普通意义上的 ground truth ratio，而是 oracle 正确率。
 
 ## 哪些指标会一直是 0，或者看起来像 0
 
-### 1. 现在最像“真 bug”的零值指标
+### 1. 现在更像“需要条件化展示”的指标
 
-这些字段在 [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1349) 里先被写成 0.0，但当前 trainer 代码并没有稳定地用同一套 schema 去覆盖它们：
+这些字段在 [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1325) 里先被写成 0.0，但当前 trainer 代码已经会在 two-stage 触发后用 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L458) 的返回值覆盖它们：
 
 - train/tp_rate
 - train/tn_rate
 - train/fp_rate
 - train/fn_rate
+- train/format_error_rate
+- train/reward_mean
 - train/gt_tp_rate
 - train/gt_tn_rate
 - train/gt_fp_rate
 - train/gt_fn_rate
 
-原因不是“这些数一定真的为 0”，而是当前实现里这组 key 的初始化和实际返回值 schema 没有对齐。
+原因不是“这些数一定真的为 0”，而是这组 key 在 two-stage 未触发时会保留初始化值。也就是说，它们更像“条件成立时才有意义”的指标，而不是始终都应当解释成真实的 0。
 
 更具体地说：
 
-1. [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1349) 先写了这一组占位 0。
-2. [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py#L572) 的后一个 compute_proxy_cm_reward 返回的是 proxy_cm/* 这一套 key，而 trainer 的占位 key 仍然是 tp_rate / gt_*。
-3. 如果你只看 wandb 里 train/tp_rate 这一组字段，就会看到它们长期为 0，或者根本不随真实验证变化。
+1. [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1325) 先写了这一组占位 0。
+2. 当 [ray_trainer.py](verl/verl/trainer/ppo/ray_trainer.py#L1387) 进入 second stage 时，`compute_proxy_cm_reward()` 会返回实际数值并覆盖这些占位值。
+3. 如果某一步没有触发 second stage，或者 verification batch 为空，这组指标就会保留为 0。要避免误读，最好把它们改成只在 two-stage 有效时才记录，或者统一改成更明确的 `train/two_stage_proxy_cm/*` 命名。
 
 ### 2. 另一类“看起来像 0，但其实是正常”的指标
 
@@ -123,9 +129,9 @@
 
 ## 目前最应该关注的修复点
 
-1. 统一 compute_proxy_cm_reward 的版本，只保留一套 schema。当前 [two_stage_utils.py](verl/verl/utils/reward_score/ttrl/two_stage_utils.py) 里有两个同名实现，这是第一优先级问题。
-2. 让 ray_trainer 的初始化 key 和实际写入 key 完全一致。现在的 train/tp_rate 和 train/gt_* 这组 key，和后面的返回结果不在同一语义层上。
-3. 如果你要继续沿用当前看板，建议把 raw label_accuracy 当成“effective label accuracy”看，不要再把它直接理解成多数票准确率。
+1. 把 proxy confusion matrix 这一组指标改成更明确的命名空间，例如 `train/two_stage_proxy_cm/*`，避免它们和主训练指标混在一起。
+2. 把 `train/tp_rate`、`train/tn_rate`、`train/fp_rate`、`train/fn_rate`、`train/format_error_rate`、`train/reward_mean`、`train/gt_*` 从“始终初始化为 0.0”的写法改成条件化记录，或者至少在看板说明里标清楚“未触发 second stage 时它们只是占位值”。
+3. 如果你要继续沿用当前看板，建议把 raw label_accuracy 当成“effective label accuracy”看，不要再把它直接理解成多数票准确率；`majority_voting_reward` 和 `ground_truth_ratio` 也建议尽快换名。
 
 ## 推荐的看板解读方式
 
@@ -135,9 +141,35 @@
 - 验证稳定性：two_stage_parse_fail_rate
 - 两阶段纠偏能力：two_stage_filtered_ratio
 - 最终标签质量：label_accuracy_majority 对比 label_accuracy_two_stage
-- 代理混淆矩阵：在修复 compute_proxy_cm_reward schema 之后再看 tp_rate / gt_* 这一组；修复前不要把它们当成可信结论
+- 代理混淆矩阵：把 train/tp_rate 这一组按 two-stage proxy CM 来理解；如果后续改成 `train/two_stage_proxy_cm/*`，看板语义会更清楚
 
-如果你希望，我下一步可以直接把这份审计里指出的两个代码问题也修掉：
+如果你希望，我下一步可以直接把这份审计里指出的两个命名问题也修掉：
 
-1. 删掉或重命名 two_stage_utils.py 里重复的 compute_proxy_cm_reward。
-2. 把 ray_trainer.py 的混淆矩阵 key 对齐到唯一的 schema，避免 train/tp_rate 这组字段继续长期为 0。
+1. 把 proxy CM 指标从 `train/tp_rate` 这类泛化命名迁移到 `train/two_stage_proxy_cm/*`。
+2. 把 `label_accuracy`、`majority_voting_reward`、`ground_truth_ratio`、`neg_log_likelihood` 这几个容易误读的字段同步改名。
+ 
+ # # #   �e�X�vؚ6�R�gch  ( A d v a n c e d   T w o - S t a g e   M e t r i c s ) 
+ 
+ # # # #   1 .   *Oh~{�l��s  ( P s e u d o - L a b e l   F l i p   R a t e   /   \ 	 r a i n / t w o _ s t a g e _ f l i p _ r a t e \ ) 
+ -   * * �[IN* * �(W~  B �NO N�'`:S	�-N� g�~��T�Nu�v*Oh~{  { p s e u d o } $   N,{ N6��kUS�~�vYpe�bhy�~�g  { m a j } $   N N�v�k�O0
+ -   * * lQ_* * �
+     }   \ t e x t { F l i p   R a t e }   =   \ f r a c { \ t e x t { C o u n t } ( y _ { p s e u d o }   \ n e q   y _ { m a j } ,   \ t e x t { i n   R o u t e   B } ) } { \ t e x t { C o u n t } ( \ t e x t { R o u t e   B } ) } } 
+ 
+ # # # #   2 .   �~��Q�X�v  ( N e t   C o r r e c t i o n   G a i n   /   \ 	 r a i n / t w o _ s t a g e _ n e t _ c o r r e c t i o n _ g a i n \ ) 
+ -   * * �[IN* * �a�ϑ����:g6R&^eg�v�[E�Sb�i6e�v0
+ -   * * ���{* * ��l�TT{Hhcknx�vpeϑ  -   �l�TT{Hh�vpeϑ0
+ 
+ # # # #   3 .   jV�cxp��Q�s  ( N o i s e   M a s k i n g   D e c a y   R a t e   /   \ 	 r a i n / t w o _ s t a g e _ n o i s e _ m a s k _ r a t e \ ) 
+ -   * * �[IN* * ���S   
+ P[~ 
+ B 2 ��eP	��n��ag�N��Ǐ�f�e	�  �v7h,g`S;`7h,g�v�k�O  ( $ \ m a t h c a l { R } _ { m a s k } $ ) 0
+ -   * * t����g* * ��eg��Y  4 0 % 	�ؚ���@w!j�W���R�X:_�s^�nNM��  5 %   �]�S0
+ -   * * lQ_* * �
+     }   \ m a t h c a l { R } _ { m a s k }   =   \ f r a c { \ t e x t { C o u n t } ( \ t e x t { R o u t e   B 2 } ) } { \ t e x t { C o u n t } ( \ t e x t { A l l   G r o u p s } ) }   } 
+ 
+ # # # #   4 .   �[��XTۂ;R�^cpe  ( A u d i t o r   S t r i c t n e s s   I n d e x   /   \ 	 r a i n / s t r i c t n e s s _ i n d e x \ ) 
+ -   * * �[IN* * �(W,{�N6��k����h���-N�!j�W���Q  F a l s e   �v�k�OOP�y�^�a�ϑ  V e r i f i e r   SbGP/ �@g�v%N�Sz�^0
+ -   * * lQ_* * �
+     }   \ m a t h c a l { I } _ { s t r i c t }   =   \ f r a c { \ t e x t { P r o x y   F N   ( �@g) }   +   \ t e x t { P r o x y   T N   ( �c��) } } { \ t e x t { P r o x y   F P   ( �v�vD��T) }   +   \ t e x t { P r o x y   T P   ( nx��) } }   } 
+  
+ 
