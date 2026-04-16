@@ -1269,7 +1269,7 @@ class SemanticTTRLRewardManager:
                 group_extra_info.append(extra_info)
             
             # === Calculate base rewards (correctness judgment based on voting) ===
-            base_rewards, ttrl_metrics = test_time_train_metrics(
+            base_rewards, ttrl_metrics, _ = test_time_train_metrics(
                 group_pred_outputs, group_labels, task=task, extra_info=group_extra_info
             )
 
@@ -1473,7 +1473,7 @@ class SemanticTTRLRewardManager:
             group_task = self._data_source_to_task(first_ds)
             
             # Calculate TTRL metrics for current prompt
-            _, ttrl_metrics = test_time_train_metrics(
+            _, ttrl_metrics, _ = test_time_train_metrics(
                 group_pred_outputs_ttrl, group_labels_ttrl, task=group_task, extra_info=group_extra_info_ttrl
             )
 

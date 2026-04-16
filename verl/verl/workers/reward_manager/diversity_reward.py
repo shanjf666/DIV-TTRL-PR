@@ -450,7 +450,7 @@ class DiversityTTRLRewardManager:
                     )
 
             verified_label = verified_labels[prompt_i]
-            base_rewards, ttrl_metrics = test_time_train_metrics(
+            base_rewards, ttrl_metrics, _ = test_time_train_metrics(
                 group_pred_outputs, group_labels, task=task, extra_info=group_extra_info,
                 verified_label=verified_label
             )
@@ -715,7 +715,7 @@ class DiversityTTRLRewardManager:
             group_extra_info = all_extra_infos[start:end]
             group_task = self._data_source_to_task(all_data_sources[start])
 
-            _, ttrl_metrics = test_time_train_metrics(
+            _, ttrl_metrics, _ = test_time_train_metrics(
                 group_pred_outputs, group_labels, task=group_task, extra_info=group_extra_info
             )
 

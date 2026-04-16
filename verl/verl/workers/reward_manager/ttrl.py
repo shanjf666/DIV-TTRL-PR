@@ -281,7 +281,6 @@ class TTRLRewardManager:
                 # 1. Identify all online answers and calculate online consistency
                 from verl.utils.reward_score.ttrl.auto_extract import auto_extract
                 model_answers = auto_extract(task, group_pred_outputs, extra_info=group_extra_info)
-                from collections import Counter
                 online_counter = Counter(model_answers)
 
                 online_voted_answer, majority_count = online_counter.most_common(1)[0] if online_counter else (None, 0)
@@ -337,12 +336,19 @@ class TTRLRewardManager:
                             print(f"Warning: Online SC {online_consistency_rate:.2f} < 0.3 but no label found for prompt in {self.pseudo_label_file}")
 
                 # 5. Compute reward using chosen label
-                rewards, ttrl_metrics = test_time_train_metrics(group_pred_outputs, group_labels, task=task, extra_info=group_extra_info, verified_label=verified_label)
+                rewards, ttrl_metrics, ttrl_details = test_time_train_metrics(
+                    group_pred_outputs,
+                    group_labels,
+                    task=task,
+                    extra_info=group_extra_info,
+                    verified_label=verified_label,
+                    model_answers=model_answers,
+                    return_details=True,
+                )
                 
                 # Accuracy comparison metrics
                 ground_truth = group_labels[0]
-                is_maj_correct, _ = auto_verify(task, [online_voted_answer], [ground_truth], extra_info=[group_extra_info[0]])
-                ttrl_metrics["label_accuracy_majority"] = float(is_maj_correct[0])
+                ttrl_metrics["label_accuracy_majority"] = float(ttrl_details.get("majority_hit", 0.0))
                 ttrl_metrics["label_accuracy_two_stage"] = ttrl_metrics["label_accuracy"] # label_accuracy in ttt_metrics already uses verified_label if provided
 
                 ttrl_metrics["off_policy_ratio"] = off_policy
@@ -360,10 +366,7 @@ class TTRLRewardManager:
 
                 # Compute FP/FN rates (skip if penalize mode set all rewards to -1)
                 ground_truth = group_labels[0]
-                true_rewards, _ = auto_verify(
-                    task, group_pred_outputs, [ground_truth] * len(group_pred_outputs),
-                    extra_info=group_extra_info
-                )
+                true_rewards = ttrl_details.get("true_rewards", [])
                 # For FP/FN, treat -1 rewards as negative (not a true positive)
                 effective_rewards = [max(0, r) for r in rewards]
                 n_pseudo_pos = sum(1 for r in effective_rewards if r > 0)
@@ -541,7 +544,7 @@ class TTRLRewardManager:
                     group_pred_outputs_ttrl.append(response_str)
                     group_extra_info_ttrl.append(extra_info)
 
-                _, ttrl_metrics = test_time_train_metrics(group_pred_outputs_ttrl, group_labels_ttrl, task=task, extra_info=group_extra_info_ttrl)
+                _, ttrl_metrics, _ = test_time_train_metrics(group_pred_outputs_ttrl, group_labels_ttrl, task=task, extra_info=group_extra_info_ttrl)
                 
                 # === Calculate strategy entropy ===
                 current_group_data = data[prompt_i * self.eval_n_samples:(prompt_i + 1) * self.eval_n_samples]
