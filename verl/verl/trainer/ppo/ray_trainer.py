@@ -1067,7 +1067,7 @@ class RayPPOTrainer:
 
         if verification_batch is None or len(verification_batch) == 0:
             print("[TwoStage] Empty verification batch. Skipping.")
-            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], []
+            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], [], []
 
         print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
 
@@ -1259,6 +1259,17 @@ class RayPPOTrainer:
                 verification_mapping = []
                 all_verification_outputs = []
                 print("[TwoStage] All samples skipped Stage2 training due to no valid low-consistency candidates")
+
+        # Attach per-sample high-consistency route mask for Stage2 loss diagnostics.
+        if batch_second is not None and len(batch_second) > 0 and len(verification_mapping) > 0:
+            stage2_high_consistency_mask = [
+                1.0 if verified_routes[m["prompt_group_idx"]] == "A" else 0.0
+                for m in verification_mapping
+            ]
+            batch_second.batch["two_stage_high_consistency_mask"] = torch.tensor(
+                stage2_high_consistency_mask,
+                dtype=torch.float32,
+            )
 
         final_pseudo_labels = verified_labels
         final_consistencies = verified_consistencies
@@ -1455,6 +1466,24 @@ class RayPPOTrainer:
                                 batch=batch,
                                 metrics=metrics,
                             )
+
+                            # Attach per-sample high-consistency route mask for Stage1 loss diagnostics.
+                            if verified_routes is not None and len(verified_routes) > 0:
+                                expanded_high_consistency_mask = []
+                                for route in verified_routes:
+                                    flag = 1.0 if route == "A" else 0.0
+                                    expanded_high_consistency_mask.extend([flag] * self.n_votes_per_prompt)
+
+                                if len(expanded_high_consistency_mask) == len(batch):
+                                    batch.batch["two_stage_high_consistency_mask"] = torch.tensor(
+                                        expanded_high_consistency_mask,
+                                        dtype=torch.float32,
+                                    )
+                                else:
+                                    print(
+                                        "[TwoStage] Warning: high-consistency mask length mismatch "
+                                        f"({len(expanded_high_consistency_mask)} vs {len(batch)}). Skip Stage1 mask injection."
+                                    )
                             
                             # [no_update_both] Inject zero_advantage_mask for Route B2 groups
                             if self.two_stage_fallback_mode == "no_update_both" and verified_routes is not None:
@@ -1562,6 +1591,7 @@ class RayPPOTrainer:
                                 advantages = advantages * alpha
                                 batch_second.batch["advantages"] = advantages
                                 batch_second.batch["returns"] = returns
+                                batch_second.meta_info["lambda_second_applied"] = alpha
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.

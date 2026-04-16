@@ -279,10 +279,57 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        high_consistency_key = "two_stage_high_consistency_mask"
+
+        # Diagnostic accumulators for high-consistency samples (Route A)
+        stage1_hc_pg_loss_token_sum = 0.0
+        stage1_hc_token_count = 0.0
+        stage1_hc_sample_count = 0.0
+        stage2_hc_pg_loss_token_sum = 0.0
+        stage2_hc_token_count = 0.0
+        stage2_hc_sample_count = 0.0
+        stage2_hc_pg_loss_token_sum_pre_lambda = 0.0
+
+        def _compute_seq_pg_token_stats(
+            old_log_prob_t,
+            log_prob_t,
+            advantages_t,
+            response_mask_t,
+            cliprange_t,
+            cliprange_low_t,
+            cliprange_high_t,
+            clip_ratio_c_t,
+        ):
+            """Return per-sequence token-sum pg losses and token counts under PPO clipping."""
+            negative_approx_kl_t = log_prob_t - old_log_prob_t
+            ratio_t = torch.exp(negative_approx_kl_t)
+
+            pg_losses1_t = -advantages_t * ratio_t
+            if cliprange_low_t is None:
+                cliprange_low_t = cliprange_t
+            if cliprange_high_t is None:
+                cliprange_high_t = cliprange_t
+
+            pg_losses2_t = -advantages_t * torch.clamp(
+                ratio_t,
+                1 - cliprange_low_t,
+                1 + cliprange_high_t,
+            )
+            clip_pg_losses1_t = torch.maximum(pg_losses1_t, pg_losses2_t)
+
+            pg_losses3_t = -advantages_t * clip_ratio_c_t
+            clip_pg_losses2_t = torch.min(pg_losses3_t, clip_pg_losses1_t)
+            pg_losses_t = torch.where(advantages_t < 0, clip_pg_losses2_t, clip_pg_losses1_t)
+
+            seq_token_sums_t = torch.sum(pg_losses_t * response_mask_t, dim=-1)
+            seq_token_counts_t = torch.sum(response_mask_t, dim=-1).clamp(min=1)
+            return seq_token_sums_t, seq_token_counts_t
 
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
+        if high_consistency_key in data.batch.keys():
+            select_keys.append(high_consistency_key)
         batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
@@ -303,6 +350,7 @@ class DataParallelPPOActor(BasePPOActor):
         lambda_second = self.config.get("lambda_second", 0.5)
 
         if data_second is not None:
+            lambda_second_applied = float(data_second.meta_info.get("lambda_second_applied", 1.0))
             # Group Stage 2 samples by UID (same prompt & candidate)
             uids = data_second.non_tensor_batch.get("uid", None)
             if uids is not None:
@@ -319,6 +367,8 @@ class DataParallelPPOActor(BasePPOActor):
                 # Distribute groups evenly into verification_mini_batches
                 for i, group in enumerate(verification_groups):
                     verification_mini_batches[i % max(1, num_mini_batches)].append(group)
+        else:
+            lambda_second_applied = 1.0
 
         metrics = {}
         for epoch in range(self.config.ppo_epochs):
@@ -387,6 +437,24 @@ class DataParallelPPOActor(BasePPOActor):
                         clip_ratio_c=clip_ratio_c,
                         loss_agg_mode=loss_agg_mode,
                     )
+
+                    high_consistency_mask = data.get(high_consistency_key, None)
+                    if high_consistency_mask is not None:
+                        seq_token_sums, seq_token_counts = _compute_seq_pg_token_stats(
+                            old_log_prob_t=old_log_prob,
+                            log_prob_t=log_prob,
+                            advantages_t=advantages,
+                            response_mask_t=response_mask,
+                            cliprange_t=clip_ratio,
+                            cliprange_low_t=clip_ratio_low,
+                            cliprange_high_t=clip_ratio_high,
+                            clip_ratio_c_t=clip_ratio_c,
+                        )
+                        hc_mask = high_consistency_mask > 0.5
+                        if hc_mask.any():
+                            stage1_hc_pg_loss_token_sum += seq_token_sums[hc_mask].sum().detach().item()
+                            stage1_hc_token_count += seq_token_counts[hc_mask].sum().detach().item()
+                            stage1_hc_sample_count += hc_mask.sum().detach().item()
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
@@ -488,6 +556,38 @@ class DataParallelPPOActor(BasePPOActor):
                             clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
                             loss_agg_mode=self.config.loss_agg_mode,
                         )
+
+                        if not is_dummy:
+                            high_consistency_mask_s = mb_s.get(high_consistency_key, None)
+                            if high_consistency_mask_s is not None:
+                                seq_token_sums_s, seq_token_counts_s = _compute_seq_pg_token_stats(
+                                    old_log_prob_t=mb_s["old_log_probs"],
+                                    log_prob_t=log_prob_s,
+                                    advantages_t=mb_s["advantages"],
+                                    response_mask_t=response_mask_s,
+                                    cliprange_t=self.config.clip_ratio,
+                                    cliprange_low_t=self.config.get("clip_ratio_low", self.config.clip_ratio),
+                                    cliprange_high_t=self.config.get("clip_ratio_high", self.config.clip_ratio),
+                                    clip_ratio_c_t=self.config.get("clip_ratio_c", 3.0),
+                                )
+                                hc_mask_s = high_consistency_mask_s > 0.5
+                                if hc_mask_s.any():
+                                    stage2_hc_pg_loss_token_sum += seq_token_sums_s[hc_mask_s].sum().detach().item()
+                                    stage2_hc_token_count += seq_token_counts_s[hc_mask_s].sum().detach().item()
+                                    stage2_hc_sample_count += hc_mask_s.sum().detach().item()
+
+                                    if abs(lambda_second_applied) > 1e-8:
+                                        seq_token_sums_s_pre_lambda, _ = _compute_seq_pg_token_stats(
+                                            old_log_prob_t=mb_s["old_log_probs"],
+                                            log_prob_t=log_prob_s,
+                                            advantages_t=mb_s["advantages"] / lambda_second_applied,
+                                            response_mask_t=response_mask_s,
+                                            cliprange_t=self.config.clip_ratio,
+                                            cliprange_low_t=self.config.get("clip_ratio_low", self.config.clip_ratio),
+                                            cliprange_high_t=self.config.get("clip_ratio_high", self.config.clip_ratio),
+                                            clip_ratio_c_t=self.config.get("clip_ratio_c", 3.0),
+                                        )
+                                        stage2_hc_pg_loss_token_sum_pre_lambda += seq_token_sums_s_pre_lambda[hc_mask_s].sum().detach().item()
                         
                         if is_dummy:
                             loss_s = pg_loss_s * 0.0
@@ -504,5 +604,47 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 data = {"actor/grad_norm": grad_norm.detach().item()}
             append_to_dict(metrics, data)
+
+        stage1_hc_pg_loss_token_mean = (
+            stage1_hc_pg_loss_token_sum / stage1_hc_token_count if stage1_hc_token_count > 0 else 0.0
+        )
+        stage2_hc_pg_loss_token_mean = (
+            stage2_hc_pg_loss_token_sum / stage2_hc_token_count if stage2_hc_token_count > 0 else 0.0
+        )
+        stage2_to_stage1_hc_abs_ratio = (
+            abs(stage2_hc_pg_loss_token_sum) / max(abs(stage1_hc_pg_loss_token_sum), 1e-8)
+            if stage1_hc_token_count > 0
+            else 0.0
+        )
+        stage2_to_stage1_hc_signed_ratio = (
+            stage2_hc_pg_loss_token_sum / stage1_hc_pg_loss_token_sum
+            if abs(stage1_hc_pg_loss_token_sum) > 1e-8
+            else 0.0
+        )
+        stage2_to_stage1_hc_abs_ratio_pre_lambda = (
+            abs(stage2_hc_pg_loss_token_sum_pre_lambda) / max(abs(stage1_hc_pg_loss_token_sum), 1e-8)
+            if stage1_hc_token_count > 0
+            else 0.0
+        )
+
+        append_to_dict(
+            metrics,
+            {
+                "actor/high_consistency_stage1_pg_loss_token_sum": float(stage1_hc_pg_loss_token_sum),
+                "actor/high_consistency_stage2_pg_loss_token_sum": float(stage2_hc_pg_loss_token_sum),
+                "actor/high_consistency_stage1_pg_loss_token_mean": float(stage1_hc_pg_loss_token_mean),
+                "actor/high_consistency_stage2_pg_loss_token_mean": float(stage2_hc_pg_loss_token_mean),
+                "actor/high_consistency_stage1_token_count": float(stage1_hc_token_count),
+                "actor/high_consistency_stage2_token_count": float(stage2_hc_token_count),
+                "actor/high_consistency_stage1_sample_count": float(stage1_hc_sample_count),
+                "actor/high_consistency_stage2_sample_count": float(stage2_hc_sample_count),
+                "actor/high_consistency_stage2_to_stage1_pg_loss_abs_sum_ratio": float(stage2_to_stage1_hc_abs_ratio),
+                "actor/high_consistency_stage2_to_stage1_pg_loss_signed_sum_ratio": float(stage2_to_stage1_hc_signed_ratio),
+                "actor/high_consistency_stage2_pg_loss_token_sum_pre_lambda": float(stage2_hc_pg_loss_token_sum_pre_lambda),
+                "actor/high_consistency_stage2_to_stage1_pg_loss_abs_sum_ratio_pre_lambda": float(stage2_to_stage1_hc_abs_ratio_pre_lambda),
+                "actor/high_consistency_lambda_second_applied": float(lambda_second_applied),
+            },
+        )
+
         self.actor_optimizer.zero_grad()
         return metrics
