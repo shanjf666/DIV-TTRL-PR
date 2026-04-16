@@ -414,6 +414,7 @@ class RayPPOTrainer:
             self.two_stage_max_candidates = getattr(self.config, 'two_stage_max_candidates', 10)
             self.two_stage_max_new_tokens = getattr(self.config, 'two_stage_max_new_tokens', 2048)
             self.two_stage_fallback = getattr(self.config, 'two_stage_fallback', 'majority')  # 'majority' or 'penalize'
+            self.two_stage_fallback_mode = getattr(self.config, 'two_stage_fallback_mode', 'no_update_second')  # 'no_update_second' or 'no_update_both'
             self.two_stage_micro_batch_size = getattr(self.config, 'two_stage_micro_batch_size', 0)  # 0 = auto
             self.two_stage_temperature = getattr(self.config, 'two_stage_temperature', 0.2)
             self.two_stage_top_p = getattr(self.config, 'two_stage_top_p', 0.85)
@@ -1066,7 +1067,7 @@ class RayPPOTrainer:
 
         if verification_batch is None or len(verification_batch) == 0:
             print("[TwoStage] Empty verification batch. Skipping.")
-            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], []
+            return [g.get("majority_answer") for g in prompt_groups], None, [], [], [], [], []
 
         print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
 
@@ -1236,7 +1237,7 @@ class RayPPOTrainer:
             n_votes_per_prompt=self.n_votes_per_prompt,
             high_consistency_threshold=0.5,
             low_consistency_strategy="true",
-            fallback_mode="no_update_second",
+            fallback_mode=self.two_stage_fallback_mode,
         )
 
         from verl.utils.reward_score.ttrl.two_stage_utils import parse_verification_result
@@ -1258,6 +1259,17 @@ class RayPPOTrainer:
                 verification_mapping = []
                 all_verification_outputs = []
                 print("[TwoStage] All samples skipped Stage2 training due to no valid low-consistency candidates")
+
+        # Attach per-sample high-consistency route mask for Stage2 loss diagnostics.
+        if batch_second is not None and len(batch_second) > 0 and len(verification_mapping) > 0:
+            stage2_high_consistency_mask = [
+                1.0 if verified_routes[m["prompt_group_idx"]] == "A" else 0.0
+                for m in verification_mapping
+            ]
+            batch_second.batch["two_stage_high_consistency_mask"] = torch.tensor(
+                stage2_high_consistency_mask,
+                dtype=torch.float32,
+            )
 
         final_pseudo_labels = verified_labels
         final_consistencies = verified_consistencies
@@ -1333,7 +1345,7 @@ class RayPPOTrainer:
         gc.collect()
         torch.cuda.empty_cache()
 
-        return final_pseudo_labels, batch_second, all_verification_outputs, verification_mapping, groups_to_verify, final_consistencies
+        return final_pseudo_labels, batch_second, all_verification_outputs, verification_mapping, groups_to_verify, final_consistencies, verified_routes
 
     def fit(self):
         """
@@ -1450,10 +1462,40 @@ class RayPPOTrainer:
                     batch_second = None
                     if self.use_ttrl and self.two_stage_verify:
                         with _timer("two_stage_verify", timing_raw):
-                            verified_pseudo_labels, batch_second, verify_outputs, verify_mapping, groups_to_verify, pl_consistencies = self._run_two_stage_verification(
+                            verified_pseudo_labels, batch_second, verify_outputs, verify_mapping, groups_to_verify, pl_consistencies, verified_routes = self._run_two_stage_verification(
                                 batch=batch,
                                 metrics=metrics,
                             )
+
+                            # Attach per-sample high-consistency route mask for Stage1 loss diagnostics.
+                            if verified_routes is not None and len(verified_routes) > 0:
+                                expanded_high_consistency_mask = []
+                                for route in verified_routes:
+                                    flag = 1.0 if route == "A" else 0.0
+                                    expanded_high_consistency_mask.extend([flag] * self.n_votes_per_prompt)
+
+                                if len(expanded_high_consistency_mask) == len(batch):
+                                    batch.batch["two_stage_high_consistency_mask"] = torch.tensor(
+                                        expanded_high_consistency_mask,
+                                        dtype=torch.float32,
+                                    )
+                                else:
+                                    print(
+                                        "[TwoStage] Warning: high-consistency mask length mismatch "
+                                        f"({len(expanded_high_consistency_mask)} vs {len(batch)}). Skip Stage1 mask injection."
+                                    )
+                            
+                            # [no_update_both] Inject zero_advantage_mask for Route B2 groups
+                            if self.two_stage_fallback_mode == "no_update_both" and verified_routes is not None:
+                                skip_groups = [i for i, r in enumerate(verified_routes) if r == "B2"]
+                                if skip_groups:
+                                    mask = np.zeros(len(batch), dtype=np.float32)
+                                    for g_idx in skip_groups:
+                                        start = g_idx * self.n_votes_per_prompt
+                                        end = start + self.n_votes_per_prompt
+                                        mask[start:end] = 1.0
+                                    batch.non_tensor_batch["zero_advantage_mask"] = mask
+                                    print(f"[no_update_both] Marked {len(skip_groups)} Route B2 groups ({int(mask.sum())}/{len(mask)} samples) for Stage1 advantage zeroing")
                             # Inject pseudo-labels into batch for TTRLRewardManager
                             if verified_pseudo_labels is not None:
                                 expanded_labels = []
@@ -1549,6 +1591,7 @@ class RayPPOTrainer:
                                 advantages = advantages * alpha
                                 batch_second.batch["advantages"] = advantages
                                 batch_second.batch["returns"] = returns
+                                batch_second.meta_info["lambda_second_applied"] = alpha
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
@@ -1634,7 +1677,13 @@ class RayPPOTrainer:
                                 if "_label_accuracy" in ttrl_metrics:
                                     batch.non_tensor_batch["label_accuracy"] = ttrl_metrics["_label_accuracy"]
                                 if "_zero_advantage_mask" in ttrl_metrics:
-                                    batch.non_tensor_batch["zero_advantage_mask"] = ttrl_metrics["_zero_advantage_mask"]
+                                    new_mask = ttrl_metrics["_zero_advantage_mask"]
+                                    if "zero_advantage_mask" in batch.non_tensor_batch:
+                                        # Merge with existing mask (e.g. from no_update_both) via logical OR
+                                        existing_mask = batch.non_tensor_batch["zero_advantage_mask"]
+                                        batch.non_tensor_batch["zero_advantage_mask"] = np.maximum(existing_mask, new_mask)
+                                    else:
+                                        batch.non_tensor_batch["zero_advantage_mask"] = new_mask
                                 
                         except Exception as e:
                             print(f"Error in reward_fn: {e}")
