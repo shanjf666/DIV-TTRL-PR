@@ -1272,20 +1272,21 @@ class RayPPOTrainer:
             from verl.utils.reward_score.ttrl.qwen.qwen_math_parser import math_equal, extract_answer
             
             for i, g in enumerate(groups_to_verify):
-                if verified_labels[i] != g.get("majority_answer"):
+                y_pseudo = str(verified_labels[i])
+                y_maj = str(g.get("majority_answer"))
+                is_changed = not math_equal(y_pseudo, y_maj)
+
+                if is_changed:
                     success_filter_count += 1
                 
                 # Check Route B flip logic for new metrics
                 if verified_routes[i] in ("B1", "B2"):
                     route_b_count += 1
-                    if verified_labels[i] != g.get("majority_answer"):
+                    if is_changed:
                         gt_raw = g.get("ground_truth", "")
                         if gt_raw:
                             gt_str = str(gt_raw)
                             gt_ext = extract_answer(gt_str, data_name="math") or gt_str
-                            
-                            y_pseudo = str(verified_labels[i])
-                            y_maj = str(g.get("majority_answer"))
                             
                             is_pseudo_correct = math_equal(y_pseudo, gt_ext)
                             is_maj_correct = math_equal(y_maj, gt_ext)
@@ -1298,7 +1299,12 @@ class RayPPOTrainer:
             metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
             
             # New Metrics 1 & 2:
-            route_b_flips = sum(1 for i, g in enumerate(groups_to_verify) if verified_routes[i] in ("B1", "B2") and verified_labels[i] != g.get("majority_answer"))
+            route_b_flips = sum(
+                1
+                for i, g in enumerate(groups_to_verify)
+                if verified_routes[i] in ("B1", "B2")
+                and not math_equal(str(verified_labels[i]), str(g.get("majority_answer")))
+            )
             metrics["train/two_stage_flip_rate"] = route_b_flips / max(1, route_b_count)
             metrics["train/two_stage_net_correction_gain"] = float(flip_correct - flip_incorrect)
             
@@ -1616,17 +1622,6 @@ class RayPPOTrainer:
                                 # Down Sampling
                                 batch = self._select_top_k_per_prompt(batch, self.n_votes_per_prompt, self.n_samples_per_prompt)
                                 self.config.actor_rollout_ref.rollout.n = self.n_samples_per_prompt
-
-                                # Recompute ttrl metrics
-                                post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
-                                for k, v in post_reward_result.items():
-                                    metrics.update({f"train/{k}": v})
-
-                                # Recompute Entropy
-                                post_entropy_loss = agg_loss(
-                                    loss_mat=batch.batch["entropys"], loss_mask=batch.batch["response_mask"], loss_agg_mode=loss_agg_mode
-                                )
-                                metrics.update({"train/post_entropy": post_entropy_loss.detach().item()})
                                 
                                 if "_answer_types" in ttrl_metrics:
                                     batch.non_tensor_batch["answer_types"] = ttrl_metrics["_answer_types"]
@@ -1778,6 +1773,17 @@ class RayPPOTrainer:
                                 actor_output = self.actor_rollout_wg.update_actor(batch, dummy_second)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+
+                        if self.use_ttrl:
+                            # Logging-only metrics; compute them after the actor update path.
+                            post_reward_result = self.reward_fn.compute_post_ttrl_metrics(batch)
+                            for k, v in post_reward_result.items():
+                                metrics.update({f"train/{k}": v})
+
+                            post_entropy_loss = agg_loss(
+                                loss_mat=batch.batch["entropys"], loss_mask=batch.batch["response_mask"], loss_agg_mode=loss_agg_mode
+                            )
+                            metrics.update({"train/post_entropy": post_entropy_loss.detach().item()})
 
                     # validate
                     if (
