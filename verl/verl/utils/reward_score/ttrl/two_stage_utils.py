@@ -375,12 +375,166 @@ def parse_verification_result(text: str) -> Optional[bool]:
         
     return None
 
+
+def classify_consistency_bucket(
+    majority_rate: float,
+    high_consistency_threshold: float = 0.5,
+    low_consistency_threshold: Optional[float] = None,
+) -> str:
+    """Classify consistency into high/low/middle buckets.
+
+    If low_consistency_threshold is None, it falls back to the high threshold,
+    which preserves the original single-threshold behavior.
+    """
+    if low_consistency_threshold is None:
+        low_consistency_threshold = high_consistency_threshold
+
+    if low_consistency_threshold > high_consistency_threshold:
+        low_consistency_threshold = high_consistency_threshold
+
+    if majority_rate >= high_consistency_threshold:
+        return "high"
+    if majority_rate <= low_consistency_threshold:
+        return "low"
+    return "middle"
+
+
+def pad_high_consistency_candidates_to_topk(
+    prompt_groups: List[Dict],
+    max_candidates: int,
+    high_consistency_threshold: float = 0.5,
+    low_consistency_threshold: Optional[float] = None,
+    seed: Optional[int] = None,
+) -> Dict[str, int]:
+    """Pad high-consistency groups to top-k candidates using cross-prompt answers.
+
+    For each high-consistency prompt group, if candidate count is smaller than
+    ``max_candidates``, this function samples answers from other prompt groups
+    in the same batch to fill the gap.
+
+    The added candidates use frequency=1 so they can be verified in Stage 2.
+
+    Returns:
+        Stats dict with keys:
+            - high_consistency_group_count
+            - padded_group_count
+            - padded_candidate_count
+    """
+    stats = {
+        "high_consistency_group_count": 0,
+        "padded_group_count": 0,
+        "padded_candidate_count": 0,
+    }
+
+    if max_candidates is None or max_candidates <= 0 or not prompt_groups:
+        return stats
+
+    rng = np.random.default_rng(seed)
+
+    valid_answers_by_group: Dict[int, List[str]] = {}
+    all_valid_answers: List[str] = []
+
+    for group in prompt_groups:
+        group_idx = group.get("prompt_group_idx", -1)
+        group_answers: List[str] = []
+        for ans in group.get("all_answers", []):
+            if ans is None:
+                continue
+            ans_str = str(ans).strip()
+            if not ans_str:
+                continue
+            group_answers.append(ans_str)
+            all_valid_answers.append(ans_str)
+        valid_answers_by_group[group_idx] = group_answers
+
+    if not all_valid_answers:
+        return stats
+
+    for group in prompt_groups:
+        group_idx = group.get("prompt_group_idx", -1)
+        majority_rate = group.get("majority_rate", 0.0)
+        bucket = classify_consistency_bucket(
+            majority_rate=majority_rate,
+            high_consistency_threshold=high_consistency_threshold,
+            low_consistency_threshold=low_consistency_threshold,
+        )
+
+        if bucket != "high":
+            continue
+
+        stats["high_consistency_group_count"] += 1
+
+        original_candidates = list(group.get("candidates", []))
+        if len(original_candidates) >= max_candidates:
+            continue
+
+        existing_answers = {
+            str(ans).strip()
+            for ans, _ in original_candidates
+            if ans is not None and str(ans).strip()
+        }
+
+        own_answers = set(valid_answers_by_group.get(group_idx, []))
+
+        donor_pool: List[str] = []
+        for other_group_idx, other_answers in valid_answers_by_group.items():
+            if other_group_idx == group_idx:
+                continue
+            donor_pool.extend(other_answers)
+
+        if not donor_pool:
+            donor_pool = [ans for ans in all_valid_answers if ans not in own_answers]
+
+        if not donor_pool:
+            continue
+
+        need = max_candidates - len(original_candidates)
+        padded_answers: List[str] = []
+
+        unique_pool: List[str] = []
+        seen = set()
+        for ans in donor_pool:
+            if ans in seen or ans in existing_answers:
+                continue
+            seen.add(ans)
+            unique_pool.append(ans)
+
+        if unique_pool and need > 0:
+            if len(unique_pool) <= need:
+                sampled_unique = unique_pool
+            else:
+                sampled_unique = rng.choice(unique_pool, size=need, replace=False).tolist()
+            padded_answers.extend([str(x) for x in sampled_unique])
+            need -= len(sampled_unique)
+
+        if need > 0:
+            sampled_extra = rng.choice(donor_pool, size=need, replace=True).tolist()
+            padded_answers.extend([str(x) for x in sampled_extra])
+
+        if not padded_answers:
+            continue
+
+        for ans in padded_answers:
+            original_candidates.append((ans, 1))
+
+        padded_count = min(len(padded_answers), max_candidates - len(group.get("candidates", [])))
+        group["candidates"] = original_candidates[:max_candidates]
+        group["padded_candidate_count"] = padded_count
+
+        if padded_count > 0:
+            stats["padded_group_count"] += 1
+            stats["padded_candidate_count"] += padded_count
+
+    return stats
+
 def select_final_pseudo_labels(
     verification_outputs: List[str],
     verification_mapping: List[Dict],
     prompt_groups: List[Dict],
     n_votes_per_prompt: int = 8,
     high_consistency_threshold: float = 0.5,
+    low_consistency_threshold: Optional[float] = None,
+    consistency_route_by_group: Optional[Dict[int, str]] = None,
     low_consistency_strategy: str = "true",
     fallback_mode: str = "no_update_second",
 ) -> Tuple[List[str], List[float], List[bool], List[str]]:
@@ -395,6 +549,10 @@ def select_final_pseudo_labels(
         prompt_groups: Output of extract_candidate_answers().
         n_votes_per_prompt: Number of Stage1 samples per prompt.
         high_consistency_threshold: threshold for high-consistency groups.
+        low_consistency_threshold: threshold for low-consistency groups.
+            If None, falls back to high_consistency_threshold.
+        consistency_route_by_group: optional precomputed route mapping
+            (group_idx -> "high"/"low"/"middle").
         low_consistency_strategy: "true" or "majority" selection strategy for low-consistency groups.
         fallback_mode: "no_update_second" or "no_update_both" for low-consistency failures.
 
@@ -436,7 +594,17 @@ def select_final_pseudo_labels(
         majority_rate = group.get("majority_rate", 0.0)
         majority_answer = group.get("majority_answer")
 
-        if majority_rate >= high_consistency_threshold:
+        route_bucket = None
+        if consistency_route_by_group is not None:
+            route_bucket = consistency_route_by_group.get(group_idx)
+        if route_bucket not in {"high", "low", "middle"}:
+            route_bucket = classify_consistency_bucket(
+                majority_rate=majority_rate,
+                high_consistency_threshold=high_consistency_threshold,
+                low_consistency_threshold=low_consistency_threshold,
+            )
+
+        if route_bucket == "high":
             pseudo_labels[i] = majority_answer
             consistencies[i] = majority_rate
             should_update_second[i] = True

@@ -422,13 +422,34 @@ class RayPPOTrainer:
             # Dynamic temperature settings
             self.two_stage_hc_temperature = getattr(self.config, 'two_stage_hc_temperature', 1.0)
             self.two_stage_lc_temperature = getattr(self.config, 'two_stage_lc_temperature', 0.6)
-            self.two_stage_consistency_threshold = getattr(self.config, 'two_stage_consistency_threshold', 0.5)
+            legacy_consistency_threshold = getattr(self.config, 'two_stage_consistency_threshold', 0.5)
+            self.two_stage_high_consistency_threshold = getattr(
+                self.config,
+                'two_stage_high_consistency_threshold',
+                legacy_consistency_threshold,
+            )
+            self.two_stage_low_consistency_threshold = getattr(
+                self.config,
+                'two_stage_low_consistency_threshold',
+                legacy_consistency_threshold,
+            )
+            # Backward-compatible alias for external code paths that still read the old key.
+            self.two_stage_consistency_threshold = self.two_stage_high_consistency_threshold
+            self.two_stage_candidate_pad_seed = getattr(self.config, 'two_stage_candidate_pad_seed', None)
+
+            if self.two_stage_low_consistency_threshold > self.two_stage_high_consistency_threshold:
+                print(
+                    "[TwoStage] Warning: two_stage_low_consistency_threshold is greater than "
+                    "two_stage_high_consistency_threshold. Clamping low threshold to high threshold."
+                )
+                self.two_stage_low_consistency_threshold = self.two_stage_high_consistency_threshold
 
             print(f"[TwoStage] Enabled: mode={self.two_stage_mode}, n={self.two_stage_n}, "
                   f"max_candidates={self.two_stage_max_candidates}, max_new_tokens={self.two_stage_max_new_tokens}, "
                   f"fallback={self.two_stage_fallback}, temp={self.two_stage_temperature}, "
                   f"hc_temp={self.two_stage_hc_temperature}, lc_temp={self.two_stage_lc_temperature}, "
-                  f"threshold={self.two_stage_consistency_threshold}, top_p={self.two_stage_top_p}")
+                  f"hc_threshold={self.two_stage_high_consistency_threshold}, "
+                  f"lc_threshold={self.two_stage_low_consistency_threshold}, top_p={self.two_stage_top_p}")
 
         self._validate_config()
         self._create_dataloader()
@@ -1092,8 +1113,10 @@ class RayPPOTrainer:
         import gc
         from verl.utils.reward_score.ttrl.two_stage_utils import (
             extract_candidate_answers,
+            classify_consistency_bucket,
             construct_verification_dataproto,
             decode_verification_outputs,
+            pad_high_consistency_candidates_to_topk,
             select_final_pseudo_labels,
         )
         from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
@@ -1118,9 +1141,23 @@ class RayPPOTrainer:
             max_candidates=self.two_stage_max_candidates,
         )
 
+        pad_seed = self.two_stage_candidate_pad_seed
+        if pad_seed is not None:
+            pad_seed = int(pad_seed) + int(getattr(self, "global_steps", 0))
+        pad_stats = pad_high_consistency_candidates_to_topk(
+            prompt_groups=prompt_groups,
+            max_candidates=self.two_stage_max_candidates,
+            high_consistency_threshold=self.two_stage_high_consistency_threshold,
+            low_consistency_threshold=self.two_stage_low_consistency_threshold,
+            seed=pad_seed,
+        )
+
         groups_to_verify = prompt_groups
 
         metrics["train/two_stage_trigger_rate"] = 1.0 if prompt_groups else 0.0
+        metrics["train/two_stage_hc_group_count"] = float(pad_stats["high_consistency_group_count"])
+        metrics["train/two_stage_hc_padded_group_count"] = float(pad_stats["padded_group_count"])
+        metrics["train/two_stage_hc_padded_candidate_count"] = float(pad_stats["padded_candidate_count"])
         avg_majority_rate = sum(g.get("majority_rate", 0.0) for g in prompt_groups) / len(prompt_groups) if prompt_groups else 0.0
         metrics["train/two_stage_majority_rate_mean"] = avg_majority_rate
 
@@ -1164,20 +1201,47 @@ class RayPPOTrainer:
                 f"{len(row_verification_mapping)} row mappings for {total_verification_size} verification rows"
             )
 
+        group_consistency_routes = {}
+        high_group_count = 0
+        low_group_count = 0
+        middle_group_count = 0
+        for g in prompt_groups:
+            group_idx = g["prompt_group_idx"]
+            route_bucket = classify_consistency_bucket(
+                majority_rate=g.get("majority_rate", 0.0),
+                high_consistency_threshold=self.two_stage_high_consistency_threshold,
+                low_consistency_threshold=self.two_stage_low_consistency_threshold,
+            )
+            group_consistency_routes[group_idx] = route_bucket
+            if route_bucket == "high":
+                high_group_count += 1
+            elif route_bucket == "low":
+                low_group_count += 1
+            else:
+                middle_group_count += 1
+
+        metrics["train/two_stage_hc_group_route_count"] = float(high_group_count)
+        metrics["train/two_stage_lc_group_route_count"] = float(low_group_count)
+        metrics["train/two_stage_mid_group_route_count"] = float(middle_group_count)
+
         # Step 4: Split batch by consistency and run inference
         # Identify HC vs LC indices
         hc_indices = []
         lc_indices = []
+        mid_indices = []
         for i, mapping in enumerate(row_verification_mapping):
             g_idx = mapping["prompt_group_idx"]
-            m_rate = prompt_groups[g_idx].get("majority_rate", 0.0)
-            if m_rate >= self.two_stage_consistency_threshold:
+            route_bucket = group_consistency_routes.get(g_idx, "low")
+            if route_bucket == "high":
                 hc_indices.append(i)
             else:
                 lc_indices.append(i)
+                if route_bucket == "middle":
+                    mid_indices.append(i)
         
         metrics["train/two_stage_hc_verify_count"] = len(hc_indices)
         metrics["train/two_stage_lc_verify_count"] = len(lc_indices)
+        metrics["train/two_stage_mid_verify_count"] = len(mid_indices)
         metrics["train/two_stage_hc_temperature"] = self.two_stage_hc_temperature
         metrics["train/two_stage_lc_temperature"] = self.two_stage_lc_temperature
 
@@ -1244,11 +1308,12 @@ class RayPPOTrainer:
             if not has_error:
                 batch_second = batch_second_unordered[reorder_indices]
                 
-                # Setup UIDs for GRPO grouping
-                # All samples for the same prompt & candidate share a UID
+                # Setup UIDs for GRPO grouping.
+                # All samples for the same prompt share a UID so second-stage
+                # normalization happens at the prompt-group level.
                 uids = []
                 for m in verification_mapping:
-                    uid = f"verify_group_{m['prompt_group_idx']}_{m['candidate_answer']}"
+                    uid = f"verify_prompt_{m['prompt_group_idx']}"
                     uids.append(uid)
                 batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
             else:
@@ -1267,7 +1332,9 @@ class RayPPOTrainer:
             verification_mapping=verification_mapping,
             prompt_groups=groups_to_verify,
             n_votes_per_prompt=self.n_votes_per_prompt,
-            high_consistency_threshold=0.5,
+            high_consistency_threshold=self.two_stage_high_consistency_threshold,
+            low_consistency_threshold=self.two_stage_low_consistency_threshold,
+            consistency_route_by_group=group_consistency_routes,
             low_consistency_strategy="true",
             fallback_mode=self.two_stage_fallback_mode,
         )
@@ -1613,7 +1680,7 @@ class RayPPOTrainer:
                                 old_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch_second)
                                 batch_second.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
                                 
-                                # 4. Compute GRPO advantages using uid
+                                # 4. Compute GRPO advantages using prompt-group uid
                                 advantages, returns = compute_grpo_outcome_advantage(
                                     token_level_rewards=batch_second.batch["token_level_rewards"],
                                     response_mask=batch_second.batch["response_mask"],

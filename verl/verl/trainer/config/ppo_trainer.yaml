@@ -204,6 +204,12 @@ algorithm:
     horizon: 10000
     target_kl: 0.1
 
+# Two-stage verification routing defaults.
+# Keep both thresholds equal to preserve old single-threshold behavior.
+two_stage_high_consistency_threshold: 0.7
+two_stage_low_consistency_threshold: 0.4
+two_stage_candidate_pad_seed: null
+
 trainer:
   balance_batch: True
   total_epochs: 30
