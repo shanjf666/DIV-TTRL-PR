@@ -418,9 +418,17 @@ class RayPPOTrainer:
             self.two_stage_micro_batch_size = getattr(self.config, 'two_stage_micro_batch_size', 0)  # 0 = auto
             self.two_stage_temperature = getattr(self.config, 'two_stage_temperature', 0.2)
             self.two_stage_top_p = getattr(self.config, 'two_stage_top_p', 0.85)
+
+            # Dynamic temperature settings
+            self.two_stage_hc_temperature = getattr(self.config, 'two_stage_hc_temperature', 1.0)
+            self.two_stage_lc_temperature = getattr(self.config, 'two_stage_lc_temperature', 0.6)
+            self.two_stage_consistency_threshold = getattr(self.config, 'two_stage_consistency_threshold', 0.5)
+
             print(f"[TwoStage] Enabled: mode={self.two_stage_mode}, n={self.two_stage_n}, "
                   f"max_candidates={self.two_stage_max_candidates}, max_new_tokens={self.two_stage_max_new_tokens}, "
-                  f"fallback={self.two_stage_fallback}, temp={self.two_stage_temperature}, top_p={self.two_stage_top_p}")
+                  f"fallback={self.two_stage_fallback}, temp={self.two_stage_temperature}, "
+                  f"hc_temp={self.two_stage_hc_temperature}, lc_temp={self.two_stage_lc_temperature}, "
+                  f"threshold={self.two_stage_consistency_threshold}, top_p={self.two_stage_top_p}")
 
         self._validate_config()
         self._create_dataloader()
@@ -995,6 +1003,70 @@ class RayPPOTrainer:
 
         return data[selected_indices]
 
+
+    def _run_verification_inference(self, verification_batch, n_samples, target_chunk_tokens):
+        """Runs the micro-batched generation for a verification DataProto.
+        
+        Returns:
+            outputs_by_local_idx: dict mapping local row index in verification_batch -> list of n_samples responses
+            all_chunk_outputs: list of DataProto outputs for concatenated batch_second
+            info_for_reorder: list of (local_idx, chunk_offset) mappings to help reassembly
+        """
+        import gc
+        from verl.utils.seqlen_balancing import rearrange_micro_batches
+        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+        from verl.utils.reward_score.ttrl.two_stage_utils import decode_verification_outputs
+
+        if len(verification_batch) == 0:
+            return {}, [], []
+
+        micro_batches, micro_bsz_idx = rearrange_micro_batches(
+            batch=verification_batch.batch,
+            max_token_len=target_chunk_tokens,
+            dp_group=None
+        )
+
+        outputs_by_local_idx = {}
+        all_chunk_outputs = []
+        info_for_reorder = []
+        current_unordered_offset = 0
+
+        for chunk_idx, (micro_batch_tensors, indices) in enumerate(zip(micro_batches, micro_bsz_idx)):
+            nt_batch = None
+            if verification_batch.non_tensor_batch is not None:
+                nt_batch = {}
+                for k, v in verification_batch.non_tensor_batch.items():
+                    nt_batch[k] = v[indices]
+            
+            chunk = DataProto(batch=micro_batch_tensors, non_tensor_batch=nt_batch, meta_info=verification_batch.meta_info.copy())
+            chunk_padded, pad_size = pad_dataproto_to_divisor(chunk, self.actor_rollout_wg.world_size)
+
+            try:
+                chunk_output_padded = self.actor_rollout_wg.generate_sequences(chunk_padded)
+                chunk_output = unpad_dataproto(chunk_output_padded, pad_size=pad_size)
+                chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
+                
+                for i, local_idx in enumerate(indices):
+                    resp_start = i * n_samples
+                    resp_end = resp_start + n_samples
+                    outputs_by_local_idx[local_idx] = chunk_decoded[resp_start:resp_end]
+                    
+                    # Store information needed for global reorder_indices
+                    info_for_reorder.append((local_idx, current_unordered_offset + resp_start))
+                
+                current_unordered_offset += len(indices) * n_samples
+                all_chunk_outputs.append(chunk_output.to("cpu"))
+            except Exception as e:
+                print(f"[TwoStage] Error during verification chunk {chunk_idx}: {e}")
+                for local_idx in indices:
+                    outputs_by_local_idx[local_idx] = [""] * n_samples
+            finally:
+                if 'chunk_output_padded' in locals(): del chunk_output_padded
+                if 'chunk_output' in locals(): del chunk_output
+                if 'chunk_padded' in locals(): del chunk_padded
+        
+        return outputs_by_local_idx, all_chunk_outputs, info_for_reorder
+
     def _run_two_stage_verification(self, batch: DataProto, metrics: dict) -> list:
         """Run two-stage self-verification on the current batch.
 
@@ -1071,149 +1143,96 @@ class RayPPOTrainer:
 
         print(f"[TwoStage] Verification batch size: {len(verification_batch)}")
 
-        # Step 3: Set generation config for verification
+        # Step 3: Set common generation config
         verification_batch.meta_info["eos_token_id"] = self.tokenizer.eos_token_id
         verification_batch.meta_info["pad_token_id"] = self.tokenizer.pad_token_id
         verification_batch.meta_info["recompute_log_prob"] = False
-
-        # For greedy: do_sample=False triggers temperature=0 in vllm_rollout
-        # For sampling: do_sample=True with custom temperature
-        if self.two_stage_mode == "greedy":
-            verification_batch.meta_info["do_sample"] = False
-        else:
-            verification_batch.meta_info["do_sample"] = True
-            # Temperature and top_p will be passed through for sampling mode
-            verification_batch.meta_info["verification_temperature"] = self.two_stage_temperature
-            verification_batch.meta_info["verification_top_p"] = self.two_stage_top_p
-
-        # Mark as verification pass (not training vote)
         verification_batch.meta_info["do_vote"] = False
         verification_batch.meta_info["verification_mode"] = self.two_stage_mode
         verification_batch.meta_info["verification_max_new_tokens"] = self.two_stage_max_new_tokens
 
-        # Free VRAM before verification generation
-        torch.cuda.empty_cache()
-
-        # Step 4: Micro-batched verification generation
-        # Use token-aware micro-batching via rearrange_micro_batches
-        from verl.utils.seqlen_balancing import rearrange_micro_batches
+        # Step 4: Split batch by consistency and run inference
+        # Identify HC vs LC indices
+        hc_indices = []
+        lc_indices = []
+        for i, mapping in enumerate(verification_mapping):
+            g_idx = mapping["prompt_group_idx"]
+            m_rate = prompt_groups[g_idx].get("majority_rate", 0.0)
+            if m_rate >= self.two_stage_consistency_threshold:
+                hc_indices.append(i)
+            else:
+                lc_indices.append(i)
         
-        # Calculate per-sample token budget
+        metrics["train/two_stage_hc_verify_count"] = len(hc_indices)
+        metrics["train/two_stage_lc_verify_count"] = len(lc_indices)
+        metrics["train/two_stage_hc_temperature"] = self.two_stage_hc_temperature
+        metrics["train/two_stage_lc_temperature"] = self.two_stage_lc_temperature
+
+        # Calculate target chunk token capacity
         max_prompt_len = self.config.data.max_prompt_length * 2
         max_token_len = max_prompt_len + self.two_stage_max_new_tokens
-        
-        # Determine the desired chunk size (samples per chunk)
-        # Use user-configured two_stage_micro_batch_size, or default to training batch size
-        if self.two_stage_micro_batch_size > 0:
-            micro_bs = self.two_stage_micro_batch_size
-        else:
-            micro_bs = max(4, self.config.data.train_batch_size)
-        
-        # Calculate target chunk token capacity
-        # We want each chunk to comfortably fit ~micro_bs samples
-        # Add a safety factor to account for overhead (position_ids, attention_mask, etc.)
-        safety_factor = 1.2
-        target_chunk_tokens = int(micro_bs * max_token_len * safety_factor)
-        
-        # Clamp to reasonable bounds (avoid too small or too large chunks)
-        # Lower bound: 20K tokens (prevents excessive fragmentation)
-        # Upper bound: 128K tokens (prevents OOM on typical GPUs)
-        target_chunk_tokens = max(20480, min(target_chunk_tokens, 131072))
-        
-        micro_batches, micro_bsz_idx = rearrange_micro_batches(
-            batch=verification_batch.batch,
-            max_token_len=target_chunk_tokens,
-            dp_group=None
-        )
+        micro_bs = self.two_stage_micro_batch_size if self.two_stage_micro_batch_size > 0 else max(4, self.config.data.train_batch_size)
+        target_chunk_tokens = max(20480, min(int(micro_bs * max_token_len * 1.2), 131072))
 
         total_verification_size = len(verification_batch)
         n_samples = verification_batch.meta_info.get("verification_n", 1)
-        all_verification_outputs = []
-        all_chunk_outputs = []
-        
-        # When n_samples > 1 (native vLLM n-sampling):
-        # - verification_batch has 73 rows (candidates)
-        # - verification_mapping has 73 * n_samples = 584 rows (one per sample)
-        # - vLLM output will be 73 * n_samples = 584 rows (one per generated sample)
-        # 
-        # We collect outputs row-by-row in order, matching verification_mapping
-        outputs_by_orig_idx = {}  # Maps verification_batch[orig_idx] -> list of n_samples responses
-        current_unordered_offset = 0
-        reorder_indices = [0] * (total_verification_size * n_samples)
-
-        print(f"[TwoStage] Running verification inference: {total_verification_size} samples (×{n_samples} native samples) "
-              f"distributed into {len(micro_batches)} token-balanced chunks (max_token_len={target_chunk_tokens}).")
-
-        for chunk_idx, (micro_batch_tensors, indices) in enumerate(zip(micro_batches, micro_bsz_idx)):
-            # The non_tensor_batch contains raw_prompt_ids, which we must correctly slice
-            nt_batch = None
-            if verification_batch.non_tensor_batch is not None:
-                nt_batch = {}
-                for k, v in verification_batch.non_tensor_batch.items():
-                    nt_batch[k] = v[indices]
-                    
-            # Construct a DataProto slice manually
-            chunk = DataProto(batch=micro_batch_tensors, non_tensor_batch=nt_batch, meta_info=verification_batch.meta_info.copy())
-
-            # Pad to be divisible by dp_size
-            chunk_padded, pad_size = pad_dataproto_to_divisor(chunk, self.actor_rollout_wg.world_size)
-
-            try:
-                chunk_output_padded = self.actor_rollout_wg.generate_sequences(chunk_padded)
-                chunk_output = unpad_dataproto(chunk_output_padded, pad_size=pad_size)
-
-                # Decode verification responses
-                chunk_decoded = decode_verification_outputs(chunk_output, self.tokenizer)
-                
-                # chunk_output has length `len(indices) * n_samples`
-                # Collect responses by original sample index
-                for i, orig_idx in enumerate(indices):
-                    resp_start = i * n_samples
-                    resp_end = resp_start + n_samples
-                    outputs_by_orig_idx[orig_idx] = chunk_decoded[resp_start:resp_end]
-                    
-                    # Track reorder indices for batch_second reassembly
-                    for j in range(n_samples):
-                        reorder_indices[orig_idx * n_samples + j] = current_unordered_offset + resp_start + j
-                
-                current_unordered_offset += len(indices) * n_samples
-                all_chunk_outputs.append(chunk_output.to("cpu"))
-            except Exception as e:
-                print(f"[TwoStage] Error during verification chunk {chunk_idx}: {e}")
-                # Fill with empty strings on error
-                for orig_idx in indices:
-                    outputs_by_orig_idx[orig_idx] = [""] * n_samples
-            finally:
-                # Cleanup per chunk
-                if 'chunk_output_padded' in locals():
-                    del chunk_output_padded
-                if 'chunk_output' in locals():
-                    del chunk_output
-                if 'chunk_padded' in locals():
-                    del chunk_padded
-                # We NO LONGER empty_cache after every chunk to prevent stalling
-        
-        # Final GC flush after all chunks
-        gc.collect()
         torch.cuda.empty_cache()
 
-        # Reassemble flat outputs exactly matching the original DataProto order
-        for orig_idx in range(total_verification_size):
-            resps = outputs_by_orig_idx.get(orig_idx, [""] * n_samples)
-            # Ensure we always extend by exactly n_samples, even if chunk failed badly
-            if len(resps) < n_samples:
-                resps = resps + [""] * (n_samples - len(resps))
-            all_verification_outputs.extend(resps)
+        # Run HC Inference (T=hc_temp)
+        hc_outputs = {}
+        hc_chunks = []
+        hc_reorder_info = []
+        if hc_indices:
+            print(f"[TwoStage] Running HC verification ({len(hc_indices)} samples) at T={self.two_stage_hc_temperature}")
+            hc_batch = verification_batch[hc_indices]
+            hc_batch.meta_info["do_sample"] = (self.two_stage_hc_temperature > 0)
+            hc_batch.meta_info["verification_temperature"] = self.two_stage_hc_temperature
+            hc_batch.meta_info["verification_top_p"] = self.two_stage_top_p
+            hc_outputs, hc_chunks, hc_reorder_info = self._run_verification_inference(hc_batch, n_samples, target_chunk_tokens)
 
-        print(f"[TwoStage] Decoded {len(all_verification_outputs)} verification outputs")
+        # Run LC Inference (T=lc_temp)
+        lc_outputs = {}
+        lc_chunks = []
+        lc_reorder_info = []
+        if lc_indices:
+            print(f"[TwoStage] Running LC verification ({len(lc_indices)} samples) at T={self.two_stage_lc_temperature}")
+            lc_batch = verification_batch[lc_indices]
+            lc_batch.meta_info["do_sample"] = (self.two_stage_lc_temperature > 0)
+            lc_batch.meta_info["verification_temperature"] = self.two_stage_lc_temperature
+            lc_batch.meta_info["verification_top_p"] = self.two_stage_top_p
+            lc_outputs, lc_chunks, lc_reorder_info = self._run_verification_inference(lc_batch, n_samples, target_chunk_tokens)
+
+        # Step 5: Merge Results
+        all_verification_outputs = [None] * (total_verification_size * n_samples)
+        for local_idx, resps in hc_outputs.items():
+            orig_idx = hc_indices[local_idx]
+            all_verification_outputs[orig_idx * n_samples : (orig_idx + 1) * n_samples] = resps
+        for local_idx, resps in lc_outputs.items():
+            orig_idx = lc_indices[local_idx]
+            all_verification_outputs[orig_idx * n_samples : (orig_idx + 1) * n_samples] = resps
         
-        # Combine all chunk outputs into batch_second
-        if len(all_chunk_outputs) > 0:
+        # Merge batch_second
+        all_chunk_outputs = hc_chunks + lc_chunks
+        if all_chunk_outputs:
             batch_second_unordered = DataProto.concat(all_chunk_outputs)
+            reorder_indices = [0] * (total_verification_size * n_samples)
             
-            has_error = current_unordered_offset < total_verification_size * n_samples
+            # Reorder logic: first part of batch_second_unordered is from hc_chunks
+            for local_idx, unordered_offset in hc_reorder_info:
+                orig_idx = hc_indices[local_idx]
+                for j in range(n_samples):
+                    reorder_indices[orig_idx * n_samples + j] = unordered_offset + j
+            
+            # Second part is from lc_chunks
+            hc_total_unordered = len(hc_indices) * n_samples
+            for local_idx, unordered_offset in lc_reorder_info:
+                orig_idx = lc_indices[local_idx]
+                for j in range(n_samples):
+                    reorder_indices[orig_idx * n_samples + j] = hc_total_unordered + unordered_offset + j
+            
+            # Verify if reorder_indices is complete (on total samples including native n-samples)
+            has_error = (len(hc_reorder_info) + len(lc_reorder_info)) < total_verification_size
             if not has_error:
-                # Reorder batch_second to match original verification_mapping order
                 batch_second = batch_second_unordered[reorder_indices]
                 
                 # Setup UIDs for GRPO grouping
@@ -1224,10 +1243,14 @@ class RayPPOTrainer:
                     uids.append(uid)
                 batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
             else:
-                print("[TwoStage] Warning: Dropped chunks detected. Discarding batch_second to prevent mapping corruption.")
+                print("[TwoStage] Warning: Chunks dropped. Discarding batch_second.")
                 batch_second = None
         else:
             batch_second = None
+
+        # Clean up lists of None if any
+        all_verification_outputs = [out if out is not None else "" for out in all_verification_outputs]
+        print(f"[TwoStage] Final decoded {len(all_verification_outputs)} verification outputs")
 
         # Step 5: Resolve pseudo-labels
         verified_labels, verified_consistencies, should_update_flags, verified_routes = select_final_pseudo_labels(
