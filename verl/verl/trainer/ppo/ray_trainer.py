@@ -1480,6 +1480,8 @@ class RayPPOTrainer:
                         "train/gt_tn_rate": 0.0,
                         "train/gt_fp_rate": 0.0,
                         "train/gt_fn_rate": 0.0,
+                        "train/test_minority_zeroed_ratio": 0.0,
+                        "train/test_minority_low_consistency_count": 0.0,
                     })
 
                     batch_second = None
@@ -1753,22 +1755,30 @@ class RayPPOTrainer:
                             diversity_density_config=diversity_density_config,
                         )
                         
-                        # Apply zero_advantage_mask if present (test_minority mode)
+                        # === Minority Bias Mitigation Metrics ===
+                        # Always compute the low-consistency count if we have the mask
+                        if "two_stage_high_consistency_mask" in batch.batch:
+                            n_lc_total = int((1.0 - batch.batch["two_stage_high_consistency_mask"]).sum().item())
+                            metrics["train/test_minority_low_consistency_count"] = float(n_lc_total)
+                        
+                        # Apply advantage zeroing and compute ratio
                         if "zero_advantage_mask" in batch.non_tensor_batch:
                             zero_mask = torch.tensor(
                                 batch.non_tensor_batch["zero_advantage_mask"],
                                 dtype=torch.float32,
                                 device=batch.batch["advantages"].device
                             ).unsqueeze(-1)  # (batch_size, 1)
-                            # Where mask == 1, zero out the advantage
+                            
                             batch.batch["advantages"] = batch.batch["advantages"] * (1.0 - zero_mask)
                             n_zeroed = int(zero_mask.sum().item())
-                            n_low_consistency = int(zero_mask.sum().item())
-                            print(f"[test_minority] Applied zero_advantage_mask: zeroed {n_zeroed}/{len(zero_mask)} samples")
+                            
+                            # Use n_lc_total if available, else fallback to n_zeroed
+                            denom = n_lc_total if 'n_lc_total' in locals() else n_zeroed
+                            
+                            print(f"[test_minority] Applied zero_advantage_mask: zeroed {n_zeroed}/{denom} LC samples")
                             metrics["train/test_minority_zeroed_ratio"] = (
-                                float(n_zeroed) / max(1.0, float(n_low_consistency))
+                                float(n_zeroed) / max(1.0, float(denom))
                             )
-                            metrics["train/test_minority_low_consistency_count"] = float(n_low_consistency)
                         
                         # === Advantage Bias Diagnostics (PASS_GRPO only) ===
                         if (
