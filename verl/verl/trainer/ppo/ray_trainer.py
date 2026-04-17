@@ -1763,8 +1763,12 @@ class RayPPOTrainer:
                             # Where mask == 1, zero out the advantage
                             batch.batch["advantages"] = batch.batch["advantages"] * (1.0 - zero_mask)
                             n_zeroed = int(zero_mask.sum().item())
+                            n_low_consistency = int(zero_mask.sum().item())
                             print(f"[test_minority] Applied zero_advantage_mask: zeroed {n_zeroed}/{len(zero_mask)} samples")
-                            metrics["train/test_minority_zeroed_ratio"] = float(zero_mask.mean().item())
+                            metrics["train/test_minority_zeroed_ratio"] = (
+                                float(n_zeroed) / max(1.0, float(n_low_consistency))
+                            )
+                            metrics["train/test_minority_low_consistency_count"] = float(n_low_consistency)
                         
                         # === Advantage Bias Diagnostics (PASS_GRPO only) ===
                         if (

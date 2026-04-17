@@ -296,18 +296,30 @@ class vLLMRollout(BaseRollout):
         )
         attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
 
+        validate_mode = bool(prompts.meta_info.get("validate", False))
+
         # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                # 'old_log_probs': log_probs, # we will recompute old log prob with actor
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
+        if validate_mode:
+            batch = TensorDict(
+                {
+                    "prompts": idx,
+                    "responses": response,
+                    "attention_mask": attention_mask,
+                },
+                batch_size=batch_size,
+            )
+        else:
+            batch = TensorDict(
+                {
+                    "prompts": idx,
+                    "responses": response,
+                    "input_ids": seq,  # here input_ids become the whole sentences
+                    # 'old_log_probs': log_probs, # we will recompute old log prob with actor
+                    "attention_mask": attention_mask,
+                    "position_ids": position_ids,
+                },
+                batch_size=batch_size,
+            )
 
         # free vllm cache engine
         if vllm_version in ("0.3.1", "0.4.2", "0.5.4", "0.6.3") and self.config.free_cache_engine:
