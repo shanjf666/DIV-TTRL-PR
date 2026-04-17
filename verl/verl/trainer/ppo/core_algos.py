@@ -489,7 +489,6 @@ def compute_pass_grpo_penalized_advantage(
     return advantages, returns, metrics
 
 
-
 class AdaptiveKLController:
     """
     Adaptive KL controller described in the paper:

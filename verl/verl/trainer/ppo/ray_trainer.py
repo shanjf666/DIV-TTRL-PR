@@ -1151,11 +1151,24 @@ class RayPPOTrainer:
         verification_batch.meta_info["verification_mode"] = self.two_stage_mode
         verification_batch.meta_info["verification_max_new_tokens"] = self.two_stage_max_new_tokens
 
+        total_verification_size = len(verification_batch)
+        verification_n = verification_batch.meta_info.get("verification_n", 1)
+        torch.cuda.empty_cache()
+
+        # verification_mapping is sample-level when n_samples > 1, but batch slicing
+        # must operate on row-level indices.
+        row_verification_mapping = verification_mapping[::verification_n] if verification_n > 1 else verification_mapping
+        if len(row_verification_mapping) != total_verification_size:
+            raise ValueError(
+                "Verification mapping size mismatch: "
+                f"{len(row_verification_mapping)} row mappings for {total_verification_size} verification rows"
+            )
+
         # Step 4: Split batch by consistency and run inference
         # Identify HC vs LC indices
         hc_indices = []
         lc_indices = []
-        for i, mapping in enumerate(verification_mapping):
+        for i, mapping in enumerate(row_verification_mapping):
             g_idx = mapping["prompt_group_idx"]
             m_rate = prompt_groups[g_idx].get("majority_rate", 0.0)
             if m_rate >= self.two_stage_consistency_threshold:
@@ -1174,10 +1187,6 @@ class RayPPOTrainer:
         micro_bs = self.two_stage_micro_batch_size if self.two_stage_micro_batch_size > 0 else max(4, self.config.data.train_batch_size)
         target_chunk_tokens = max(20480, min(int(micro_bs * max_token_len * 1.2), 131072))
 
-        total_verification_size = len(verification_batch)
-        n_samples = verification_batch.meta_info.get("verification_n", 1)
-        torch.cuda.empty_cache()
-
         # Run HC Inference (T=hc_temp)
         hc_outputs = {}
         hc_chunks = []
@@ -1188,7 +1197,7 @@ class RayPPOTrainer:
             hc_batch.meta_info["do_sample"] = (self.two_stage_hc_temperature > 0)
             hc_batch.meta_info["verification_temperature"] = self.two_stage_hc_temperature
             hc_batch.meta_info["verification_top_p"] = self.two_stage_top_p
-            hc_outputs, hc_chunks, hc_reorder_info = self._run_verification_inference(hc_batch, n_samples, target_chunk_tokens)
+            hc_outputs, hc_chunks, hc_reorder_info = self._run_verification_inference(hc_batch, verification_n, target_chunk_tokens)
 
         # Run LC Inference (T=lc_temp)
         lc_outputs = {}
@@ -1200,35 +1209,35 @@ class RayPPOTrainer:
             lc_batch.meta_info["do_sample"] = (self.two_stage_lc_temperature > 0)
             lc_batch.meta_info["verification_temperature"] = self.two_stage_lc_temperature
             lc_batch.meta_info["verification_top_p"] = self.two_stage_top_p
-            lc_outputs, lc_chunks, lc_reorder_info = self._run_verification_inference(lc_batch, n_samples, target_chunk_tokens)
+            lc_outputs, lc_chunks, lc_reorder_info = self._run_verification_inference(lc_batch, verification_n, target_chunk_tokens)
 
         # Step 5: Merge Results
-        all_verification_outputs = [None] * (total_verification_size * n_samples)
+        all_verification_outputs = [None] * (total_verification_size * verification_n)
         for local_idx, resps in hc_outputs.items():
             orig_idx = hc_indices[local_idx]
-            all_verification_outputs[orig_idx * n_samples : (orig_idx + 1) * n_samples] = resps
+            all_verification_outputs[orig_idx * verification_n : (orig_idx + 1) * verification_n] = resps
         for local_idx, resps in lc_outputs.items():
             orig_idx = lc_indices[local_idx]
-            all_verification_outputs[orig_idx * n_samples : (orig_idx + 1) * n_samples] = resps
+            all_verification_outputs[orig_idx * verification_n : (orig_idx + 1) * verification_n] = resps
         
         # Merge batch_second
         all_chunk_outputs = hc_chunks + lc_chunks
         if all_chunk_outputs:
             batch_second_unordered = DataProto.concat(all_chunk_outputs)
-            reorder_indices = [0] * (total_verification_size * n_samples)
+            reorder_indices = [0] * (total_verification_size * verification_n)
             
             # Reorder logic: first part of batch_second_unordered is from hc_chunks
             for local_idx, unordered_offset in hc_reorder_info:
                 orig_idx = hc_indices[local_idx]
-                for j in range(n_samples):
-                    reorder_indices[orig_idx * n_samples + j] = unordered_offset + j
+                for j in range(verification_n):
+                    reorder_indices[orig_idx * verification_n + j] = unordered_offset + j
             
             # Second part is from lc_chunks
-            hc_total_unordered = len(hc_indices) * n_samples
+            hc_total_unordered = len(hc_indices) * verification_n
             for local_idx, unordered_offset in lc_reorder_info:
                 orig_idx = lc_indices[local_idx]
-                for j in range(n_samples):
-                    reorder_indices[orig_idx * n_samples + j] = hc_total_unordered + unordered_offset + j
+                for j in range(verification_n):
+                    reorder_indices[orig_idx * verification_n + j] = hc_total_unordered + unordered_offset + j
             
             # Verify if reorder_indices is complete (on total samples including native n-samples)
             has_error = (len(hc_reorder_info) + len(lc_reorder_info)) < total_verification_size
