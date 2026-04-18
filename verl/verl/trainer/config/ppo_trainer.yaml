@@ -209,6 +209,10 @@ algorithm:
 two_stage_high_consistency_threshold: 0.7
 two_stage_low_consistency_threshold: 0.4
 two_stage_candidate_pad_seed: null
+two_stage_high_consistency_advantage_sampling: true
+two_stage_high_consistency_advantage_sample_count: 8
+two_stage_high_consistency_advantage_sample_with_replacement: true
+two_stage_high_consistency_advantage_sample_seed: null
 
 trainer:
   balance_batch: True

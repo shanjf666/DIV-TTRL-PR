@@ -437,6 +437,32 @@ class RayPPOTrainer:
             self.two_stage_consistency_threshold = self.two_stage_high_consistency_threshold
             self.two_stage_candidate_pad_seed = getattr(self.config, 'two_stage_candidate_pad_seed', None)
 
+            # Stage2 advantage sampling settings (training-view only).
+            self.two_stage_high_consistency_advantage_sampling = getattr(
+                self.config,
+                'two_stage_high_consistency_advantage_sampling',
+                True,
+            )
+            self.two_stage_high_consistency_advantage_sample_count = int(
+                getattr(
+                    self.config,
+                    'two_stage_high_consistency_advantage_sample_count',
+                    self.n_votes_per_prompt,
+                )
+            )
+            self.two_stage_high_consistency_advantage_sample_with_replacement = bool(
+                getattr(
+                    self.config,
+                    'two_stage_high_consistency_advantage_sample_with_replacement',
+                    True,
+                )
+            )
+            self.two_stage_high_consistency_advantage_sample_seed = getattr(
+                self.config,
+                'two_stage_high_consistency_advantage_sample_seed',
+                None,
+            )
+
             if self.two_stage_low_consistency_threshold > self.two_stage_high_consistency_threshold:
                 print(
                     "[TwoStage] Warning: two_stage_low_consistency_threshold is greater than "
@@ -449,7 +475,9 @@ class RayPPOTrainer:
                   f"fallback={self.two_stage_fallback}, temp={self.two_stage_temperature}, "
                   f"hc_temp={self.two_stage_hc_temperature}, lc_temp={self.two_stage_lc_temperature}, "
                   f"hc_threshold={self.two_stage_high_consistency_threshold}, "
-                  f"lc_threshold={self.two_stage_low_consistency_threshold}, top_p={self.two_stage_top_p}")
+                  f"lc_threshold={self.two_stage_low_consistency_threshold}, top_p={self.two_stage_top_p}, "
+                  f"adv_sample={self.two_stage_high_consistency_advantage_sampling}, "
+                  f"adv_sample_count={self.two_stage_high_consistency_advantage_sample_count}")
 
         self._validate_config()
         self._create_dataloader()
@@ -1088,6 +1116,138 @@ class RayPPOTrainer:
         
         return outputs_by_local_idx, all_chunk_outputs, info_for_reorder
 
+    def _build_high_consistency_advantage_sample_view(
+        self,
+        batch_second: DataProto,
+        verify_mapping: list[dict],
+        groups_to_verify: list[dict],
+        verified_routes: list[str],
+        metrics: dict,
+    ):
+        """Build a sampled stage2 training view for advantage computation.
+
+        This keeps verification generation unchanged and only rebalances rows in
+        high-consistency groups before stage2 advantage calculation.
+        """
+        metrics["train/two_stage_advantage_sampling_enabled"] = (
+            1.0 if self.two_stage_high_consistency_advantage_sampling else 0.0
+        )
+
+        if not self.two_stage_high_consistency_advantage_sampling:
+            return batch_second, verify_mapping, None
+
+        if (
+            batch_second is None
+            or len(batch_second) == 0
+            or verify_mapping is None
+            or len(verify_mapping) == 0
+            or groups_to_verify is None
+            or len(groups_to_verify) == 0
+            or verified_routes is None
+            or len(verified_routes) == 0
+        ):
+            return batch_second, verify_mapping, None
+
+        target_count = max(1, int(self.two_stage_high_consistency_advantage_sample_count))
+        with_replacement = self.two_stage_high_consistency_advantage_sample_with_replacement
+        seed = self.two_stage_high_consistency_advantage_sample_seed
+        if seed is not None:
+            seed = int(seed) + int(getattr(self, "global_steps", 0))
+        rng = np.random.default_rng(seed)
+
+        route_by_group = {}
+        majority_by_group = {}
+        for i, group in enumerate(groups_to_verify):
+            group_idx = group["prompt_group_idx"]
+            if i < len(verified_routes):
+                route_by_group[group_idx] = verified_routes[i]
+            majority_by_group[group_idx] = str(group.get("majority_answer", ""))
+
+        group_rows = defaultdict(list)
+        candidate_rows = defaultdict(lambda: defaultdict(list))
+        candidate_order = defaultdict(list)
+
+        for row_idx, mapping in enumerate(verify_mapping):
+            group_idx = mapping["prompt_group_idx"]
+            cand = str(mapping["candidate_answer"])
+            group_rows[group_idx].append(row_idx)
+            candidate_rows[group_idx][cand].append(row_idx)
+            if cand not in candidate_order[group_idx]:
+                candidate_order[group_idx].append(cand)
+
+        selected_indices = []
+        affected_group_count = 0
+        majority_sample_count = 0
+        non_majority_original_count = 0
+        non_majority_sample_count = 0
+        with_replacement_extra_count = 0
+
+        for group_idx in sorted(group_rows.keys()):
+            route = route_by_group.get(group_idx, "")
+            if route != "A":
+                selected_indices.extend(group_rows[group_idx])
+                continue
+
+            affected_group_count += 1
+            majority_answer = majority_by_group.get(group_idx, "")
+
+            for cand in candidate_order[group_idx]:
+                rows = candidate_rows[group_idx][cand]
+                if len(rows) == 0:
+                    continue
+
+                if cand == majority_answer:
+                    selected_indices.extend(rows)
+                    majority_sample_count += len(rows)
+                    continue
+
+                non_majority_original_count += len(rows)
+                if len(rows) >= target_count:
+                    if len(rows) == target_count:
+                        sampled = list(rows)
+                    else:
+                        sampled = rng.choice(np.array(rows, dtype=np.int64), size=target_count, replace=False).tolist()
+                else:
+                    sampled = list(rows)
+                    if with_replacement:
+                        extra = rng.choice(
+                            np.array(rows, dtype=np.int64),
+                            size=target_count - len(rows),
+                            replace=True,
+                        ).tolist()
+                        sampled.extend(extra)
+                        with_replacement_extra_count += len(extra)
+
+                selected_indices.extend(sampled)
+                non_majority_sample_count += len(sampled)
+
+        original_rows = len(verify_mapping)
+        sampled_rows = len(selected_indices)
+
+        metrics["train/two_stage_high_consistency_advantage_group_count"] = float(affected_group_count)
+        metrics["train/two_stage_high_consistency_advantage_sample_target"] = float(target_count)
+        metrics["train/two_stage_high_consistency_majority_sample_count"] = float(majority_sample_count)
+        metrics["train/two_stage_high_consistency_non_majority_original_count"] = float(non_majority_original_count)
+        metrics["train/two_stage_high_consistency_non_majority_sample_count"] = float(non_majority_sample_count)
+        metrics["train/two_stage_advantage_sample_with_replacement_count"] = float(with_replacement_extra_count)
+        metrics["train/two_stage_advantage_sample_expansion_ratio"] = (
+            float(sampled_rows) / float(max(1, original_rows))
+        )
+        metrics["train/two_stage_advantage_sample_with_replacement_ratio"] = (
+            float(with_replacement_extra_count) / float(max(1, non_majority_sample_count))
+        )
+
+        if sampled_rows == 0:
+            return batch_second, verify_mapping, None
+
+        # No structural change, skip re-indexing work.
+        if sampled_rows == original_rows and all(idx == i for i, idx in enumerate(selected_indices)):
+            return batch_second, verify_mapping, None
+
+        sampled_batch_second = batch_second[selected_indices]
+        sampled_verify_mapping = [verify_mapping[i] for i in selected_indices]
+        return sampled_batch_second, sampled_verify_mapping, selected_indices
+
     def _run_two_stage_verification(self, batch: DataProto, metrics: dict) -> list:
         """Run two-stage self-verification on the current batch.
 
@@ -1378,6 +1538,15 @@ class RayPPOTrainer:
         flip_correct = 0
         flip_incorrect = 0
         route_b_count = 0
+        route_b_flip_count = 0
+
+        route_a_count = 0
+        route_a_correct = 0
+        route_low_count = 0
+        route_low_majority_correct = 0
+        route_low_two_stage_correct = 0
+        route_b1_count = 0
+        route_b1_correct = 0
 
         if len(groups_to_verify) > 0:
             from verl.utils.reward_score.ttrl.qwen.qwen_math_parser import math_equal, extract_answer
@@ -1386,43 +1555,79 @@ class RayPPOTrainer:
                 y_pseudo = str(verified_labels[i])
                 y_maj = str(g.get("majority_answer"))
                 is_changed = not math_equal(y_pseudo, y_maj)
+                route = verified_routes[i] if i < len(verified_routes) else ""
+                gt_raw = g.get("ground_truth", "")
+                has_gt = bool(gt_raw)
+                gt_ext = ""
+                if has_gt:
+                    gt_str = str(gt_raw)
+                    gt_ext = extract_answer(gt_str, data_name="math") or gt_str
+
+                is_pseudo_correct = math_equal(y_pseudo, gt_ext) if has_gt else False
+                is_maj_correct = math_equal(y_maj, gt_ext) if has_gt else False
+
+                if route == "A":
+                    route_a_count += 1
+                    if is_maj_correct:
+                        route_a_correct += 1
+
+                if route in ("B1", "B2"):
+                    route_low_count += 1
+                    if is_maj_correct:
+                        route_low_majority_correct += 1
+                    if is_pseudo_correct:
+                        route_low_two_stage_correct += 1
+
+                if route == "B1":
+                    route_b1_count += 1
+                    if is_pseudo_correct:
+                        route_b1_correct += 1
 
                 if is_changed:
                     success_filter_count += 1
                 
                 # Check Route B flip logic for new metrics
-                if verified_routes[i] in ("B1", "B2"):
+                if route in ("B1", "B2"):
                     route_b_count += 1
                     if is_changed:
-                        gt_raw = g.get("ground_truth", "")
-                        if gt_raw:
-                            gt_str = str(gt_raw)
-                            gt_ext = extract_answer(gt_str, data_name="math") or gt_str
-                            
-                            is_pseudo_correct = math_equal(y_pseudo, gt_ext)
-                            is_maj_correct = math_equal(y_maj, gt_ext)
-                            
+                        route_b_flip_count += 1
+                    if is_changed:
+                        if has_gt:
                             if is_pseudo_correct and not is_maj_correct:
                                 flip_correct += 1
                             elif not is_pseudo_correct and is_maj_correct:
                                 flip_incorrect += 1
 
             metrics["train/two_stage_filtered_ratio"] = success_filter_count / len(groups_to_verify)
+            metrics["train/two_stage_high_consistency_label_accuracy"] = route_a_correct / max(1, route_a_count)
+            metrics["train/two_stage_low_consistency_first_stage_label_accuracy"] = (
+                route_low_majority_correct / max(1, route_low_count)
+            )
+            metrics["train/two_stage_low_consistency_two_stage_label_accuracy"] = (
+                route_low_two_stage_correct / max(1, route_low_count)
+            )
+            metrics["train/two_stage_low_consistency_true_set_label_accuracy"] = (
+                route_b1_correct / max(1, route_b1_count)
+            )
+            metrics["train/two_stage_low_consistency_updateable_group_count"] = float(route_b1_count)
+            metrics["train/two_stage_low_consistency_true_set_coverage"] = (
+                route_b1_count / max(1, route_low_count)
+            )
             
             # New Metrics 1 & 2:
-            route_b_flips = sum(
-                1
-                for i, g in enumerate(groups_to_verify)
-                if verified_routes[i] in ("B1", "B2")
-                and not math_equal(str(verified_labels[i]), str(g.get("majority_answer")))
-            )
-            metrics["train/two_stage_flip_rate"] = route_b_flips / max(1, route_b_count)
+            metrics["train/two_stage_flip_rate"] = route_b_flip_count / max(1, route_b_count)
             metrics["train/two_stage_net_correction_gain"] = float(flip_correct - flip_incorrect)
             
             route_b2_count = sum(1 for r in verified_routes if r == "B2")
             metrics["train/two_stage_noise_mask_rate"] = route_b2_count / len(groups_to_verify)
         else:
             metrics["train/two_stage_filtered_ratio"] = 0.0
+            metrics["train/two_stage_high_consistency_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_first_stage_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_two_stage_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_true_set_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_updateable_group_count"] = 0.0
+            metrics["train/two_stage_low_consistency_true_set_coverage"] = 0.0
             metrics["train/two_stage_flip_rate"] = 0.0
             metrics["train/two_stage_net_correction_gain"] = 0.0
             metrics["train/two_stage_noise_mask_rate"] = 0.0
@@ -1662,6 +1867,20 @@ class RayPPOTrainer:
                                     verify_outputs, verify_mapping, final_pseudo_labels_dict, consistency_scores, gt_correct_scores
                                 )
                                 metrics.update({"train/" + k: v for k, v in cm_metrics.items()})
+
+                                # 1.5 Build sampled stage2 training view for advantage computation.
+                                batch_second, verify_mapping_adv, sampled_adv_indices = self._build_high_consistency_advantage_sample_view(
+                                    batch_second=batch_second,
+                                    verify_mapping=verify_mapping,
+                                    groups_to_verify=groups_to_verify,
+                                    verified_routes=verified_routes,
+                                    metrics=metrics,
+                                )
+                                if sampled_adv_indices is not None:
+                                    rewards_adv = [rewards[i] for i in sampled_adv_indices]
+                                    verify_mapping = verify_mapping_adv
+                                else:
+                                    rewards_adv = rewards
                                 
                                 # 2. Inject token_level_rewards into batch_second at last valid response token
                                 response_length = batch_second.batch["responses"].shape[-1]
@@ -1672,7 +1891,7 @@ class RayPPOTrainer:
                                 for i in range(len(batch_second)):
                                     valid_resp_len = int(batch_second.batch["response_mask"][i].sum().item())
                                     if valid_resp_len > 0:
-                                        token_level_rewards[i, valid_resp_len - 1] = rewards[i]
+                                        token_level_rewards[i, valid_resp_len - 1] = rewards_adv[i]
                                 batch_second.batch["token_level_rewards"] = token_level_rewards
                                 
                                 # 3. Compute old_log_probs
