@@ -535,8 +535,8 @@ def select_final_pseudo_labels(
     high_consistency_threshold: float = 0.5,
     low_consistency_threshold: Optional[float] = None,
     consistency_route_by_group: Optional[Dict[int, str]] = None,
-    low_consistency_strategy: str = "true",
-    fallback_mode: str = "no_update_second",
+    low_consistency_strategy: str = "majority",
+    fallback_mode: str = "no_update_both",
 ) -> Tuple[List[str], List[float], List[bool], List[str]]:
     """Resolve the final pseudo-labels and decide Stage2 participation.
 
@@ -615,7 +615,7 @@ def select_final_pseudo_labels(
         true_set_candidates = [
             (ans, info["true_count"], info["frequency"])
             for ans, info in candidate_stats.items()
-            if info["true_count"] > info["false_count"]
+            if info["true_count"] >= info["false_count"]
         ]
 
         if true_set_candidates:
