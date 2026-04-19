@@ -110,6 +110,7 @@ def extract_candidate_answers(
         group_responses = []
         group_extra_info = []
         problem_text = None
+        ground_truth = ""
 
         for j in range(n_votes_per_prompt):
             idx = prompt_i * n_votes_per_prompt + j
@@ -122,6 +123,9 @@ def extract_candidate_answers(
                 valid_prompt_length = int(data_item.batch["attention_mask"][:prompt_length].sum().item())
                 valid_prompt_ids = prompt_ids[-valid_prompt_length:]
                 problem_text = tokenizer.decode(valid_prompt_ids, skip_special_tokens=True)
+
+            if not ground_truth and "reward_model" in data_item.non_tensor_batch:
+                ground_truth = data_item.non_tensor_batch["reward_model"].get("ground_truth", "")
 
             # Decode response
             response_ids = data_item.batch["responses"]
@@ -147,9 +151,8 @@ def extract_candidate_answers(
         else:
             candidates = counter.most_common()
 
-        # Extract ground truth
-        ground_truth = ""
-        if group_extra_info and group_extra_info[0]:
+        # Extract ground truth (fallback if missing in reward_model dict)
+        if not ground_truth and group_extra_info and group_extra_info[0]:
             gt_info = group_extra_info[0].get("reward_model", {})
             ground_truth = gt_info.get("ground_truth", 
                                       group_extra_info[0].get("ground_truth", 
