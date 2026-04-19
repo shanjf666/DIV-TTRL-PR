@@ -1989,7 +1989,8 @@ class RayPPOTrainer:
                             "lam_div": getattr(self.config.algorithm, "lam_div", 0.05),
                             "c_max": getattr(self.config.algorithm, "c_max", 2.0),
                             "div_sc_threshold": getattr(self.config.algorithm, "div_sc_threshold", 0.3),
-                            "epsilon": getattr(self.config.algorithm, "epsilon", 1e-6)
+                            "epsilon": getattr(self.config.algorithm, "epsilon", 1e-6),
+                            "length_max": getattr(self.config.data, "max_response_length", 4096)
                         }
 
                         batch = compute_advantage(
@@ -2080,6 +2081,7 @@ class RayPPOTrainer:
                             "pass_grpo_penalized/avg_raw_a_passk",
                             "pass_grpo_penalized/avg_adv_raw",
                             "pass_grpo_penalized/avg_total_advantage",
+                            "pass_grpo_penalized/positive_clamped_ratio",
                         ]:
                             if pp_key in batch.meta_info:
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(batch.meta_info[pp_key])
