@@ -382,6 +382,8 @@ def compute_pass_grpo_penalized_advantage(
         r_div_count = 0
         total_adv_raw = 0.0
         total_a_passk = 0.0
+        total_clamped = 0
+        total_positive = 0
         
         for prompt_idx, sample_indices in prompt_to_samples.items():
             N = len(sample_indices)
@@ -459,8 +461,16 @@ def compute_pass_grpo_penalized_advantage(
                 group_final_adv = (group_raw_adv - mu_adv) / (std_adv + epsilon)
             else:
                 group_final_adv = group_raw_adv
-                
+            
+            # Positive-sample clamping: ensure correct answers never get negative advantage
+            # For positive samples, take max(a_pos, A_normalized) so that the advantage
+            # is at least the theoretical Pass@k base value
             for local_i, global_i in enumerate(sample_indices):
+                if answers[local_i] == 0:  # correct answer
+                    if group_final_adv[local_i] < a_pos:
+                        group_final_adv[local_i] = a_pos
+                        total_clamped += 1
+                    total_positive += 1
                 advantages_raw_np[global_i] = group_final_adv[local_i]
     
         metrics = {
@@ -470,7 +480,9 @@ def compute_pass_grpo_penalized_advantage(
             "pass_grpo_penalized/avg_adv_raw": total_adv_raw / bs if bs > 0 else 0.0,
             "pass_grpo_penalized/lam_div": lam_div,
             "pass_grpo_penalized/div_sc_threshold": div_sc_threshold,
+            "pass_grpo_penalized/positive_clamped_ratio": total_clamped / total_positive if total_positive > 0 else 0.0,
         }
+
     
         # Create GPU tensors only once at the end
         advantages_raw_tensor = torch.tensor(advantages_raw_np, dtype=dtype, device=device)
