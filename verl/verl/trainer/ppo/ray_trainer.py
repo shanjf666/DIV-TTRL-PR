@@ -1845,20 +1845,6 @@ class RayPPOTrainer:
                                     verify_outputs, verify_mapping, final_pseudo_labels_dict, consistency_scores, gt_correct_scores
                                 )
                                 metrics.update({"train/" + k: v for k, v in cm_metrics.items()})
-
-                                # 1.5 Build sampled stage2 training view for advantage computation.
-                                batch_second, verify_mapping_adv, sampled_adv_indices = self._build_high_consistency_advantage_sample_view(
-                                    batch_second=batch_second,
-                                    verify_mapping=verify_mapping,
-                                    groups_to_verify=groups_to_verify,
-                                    verified_routes=verified_routes,
-                                    metrics=metrics,
-                                )
-                                if sampled_adv_indices is not None:
-                                    rewards_adv = [rewards[i] for i in sampled_adv_indices]
-                                    verify_mapping = verify_mapping_adv
-                                else:
-                                    rewards_adv = rewards
                                 
                                 # 2. Inject token_level_rewards into batch_second at last valid response token
                                 response_length = batch_second.batch["responses"].shape[-1]
@@ -1869,7 +1855,7 @@ class RayPPOTrainer:
                                 for i in range(len(batch_second)):
                                     valid_resp_len = int(batch_second.batch["response_mask"][i].sum().item())
                                     if valid_resp_len > 0:
-                                        token_level_rewards[i, valid_resp_len - 1] = rewards_adv[i]
+                                        token_level_rewards[i, valid_resp_len - 1] = rewards[i]
                                 batch_second.batch["token_level_rewards"] = token_level_rewards
                                 
                                 # 3. Compute old_log_probs
