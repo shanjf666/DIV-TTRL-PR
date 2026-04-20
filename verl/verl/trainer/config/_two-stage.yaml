@@ -1,0 +1,31 @@
+# Two-Stage Self-Verification Pipeline Configuration Parameters
+# This file documents all available parameters and their default values used in two-stage training.
+
+# Core Enablement & Mode
+two_stage_verify: false                        # Enable the dual-stage verification pipeline
+two_stage_mode: 'greedy'                       # Verification mode: 'greedy' (select True + highest frequency) or 'sampling' (majority True votes)
+two_stage_n: 4                                 # Number of verification samples per candidate in 'sampling' mode (-1 for dynamic based on frequency)
+
+# Generation Configurations
+two_stage_max_new_tokens: 2048                 # Maximum response length for the verification generation step
+two_stage_temperature: 0.2                     # Base generation temperature for verification
+two_stage_top_p: 0.85                          # Top-p (nucleus sampling) parameter for verification inference
+two_stage_micro_batch_size: 0                  # Micro batch size for verification inference (0 means auto-calculate)
+
+# Consistency Routing & Thresholds
+# Legacy alias `two_stage_consistency_threshold` is supported and applies to both.
+two_stage_high_consistency_threshold: 0.6      # Threshold above which majority rate triggers high-consistency logic (Route A)
+two_stage_low_consistency_threshold: 0.4       # Threshold below which majority rate triggers low-consistency logic (Route B1/B2)
+two_stage_hc_temperature: 1.0                  # Generation temperature specific to high-consistency bucket verification
+two_stage_lc_temperature: 0.6                  # Generation temperature specific to low-consistency bucket verification
+
+# Candidate Truncation & Optimization (TopK)
+two_stage_max_candidates: 10                   # Global default maximum number of candidate answers to verify per prompt
+two_stage_hc_max_candidates: 5                 # Maximum candidates specifically for high-consistency samples (falls back to max_candidates)
+two_stage_lc_max_candidates: 10                 # Maximum candidates specifically for low-consistency samples (falls back to max_candidates)
+two_stage_candidate_pad_seed: null             # Random seed for candidate padding logic to ensure reproducible cross-prompt sampling
+two_stage_high_consistency_topk_padding: false  # Whether to use cross-prompt answers to pad high-consistency samples up to the target topk
+
+# Fallback Strategies
+two_stage_fallback: 'majority'                 # Fallback strategy when all candidates verify as False ('majority' or 'penalize')
+two_stage_fallback_mode: 'no_update_both'    # Training mask logic for fallbacks ('no_update_second' blocks Stage2, 'no_update_both' zero-masks Stage1 as well)

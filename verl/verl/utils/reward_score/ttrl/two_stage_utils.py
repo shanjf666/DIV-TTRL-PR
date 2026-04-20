@@ -614,6 +614,13 @@ def select_final_pseudo_labels(
             routes[i] = "A"
             continue
 
+        if route_bucket == "middle":
+            pseudo_labels[i] = majority_answer
+            consistencies[i] = majority_rate
+            should_update_second[i] = False
+            routes[i] = "M"
+            continue
+
         candidate_stats = group_stats.get(group_idx, {})
         true_set_candidates = [
             (ans, info["true_count"], info["frequency"])
