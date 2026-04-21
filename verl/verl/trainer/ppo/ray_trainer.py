@@ -1564,6 +1564,17 @@ class RayPPOTrainer:
             metrics["train/two_stage_flip_rate"] = route_b_flip_count / max(1, route_b_count)
             metrics["train/two_stage_net_correction_gain"] = float(flip_correct - flip_incorrect)
             
+            metrics["train/two_stage_low_consistency_updated_two_stage_label_accuracy"] = (
+                flip_correct / max(1, route_b_flip_count)
+            )
+            metrics["train/two_stage_low_consistency_updated_first_stage_label_accuracy"] = (
+                flip_incorrect / max(1, route_b_flip_count)
+            )
+            metrics["train/two_stage_low_consistency_updated_accuracy_gain"] = (
+                metrics["train/two_stage_low_consistency_updated_two_stage_label_accuracy"] -
+                metrics["train/two_stage_low_consistency_updated_first_stage_label_accuracy"]
+            )
+            
             route_b2_count = sum(1 for r in verified_routes if r == "B2")
             metrics["train/two_stage_noise_mask_rate"] = route_b2_count / len(groups_to_verify)
         else:
@@ -1578,6 +1589,9 @@ class RayPPOTrainer:
             metrics["train/two_stage_updated_label_accuracy"] = 0.0
             metrics["train/two_stage_updated_group_count"] = 0.0
             metrics["train/two_stage_flip_rate"] = 0.0
+            metrics["train/two_stage_low_consistency_updated_two_stage_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_updated_first_stage_label_accuracy"] = 0.0
+            metrics["train/two_stage_low_consistency_updated_accuracy_gain"] = 0.0
             metrics["train/two_stage_net_correction_gain"] = 0.0
             metrics["train/two_stage_noise_mask_rate"] = 0.0
 
