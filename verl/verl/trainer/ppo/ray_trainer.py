@@ -1402,11 +1402,11 @@ class RayPPOTrainer:
                 batch_second = batch_second_unordered[reorder_indices]
                 
                 # Setup UIDs for GRPO grouping.
-                # All samples for the same prompt share a UID so second-stage
-                # normalization happens at the prompt-group level.
+                # Each candidate answer gets its own UID so second-stage
+                # normalization happens at the candidate level.
                 uids = []
                 for m in verification_mapping:
-                    uid = f"verify_prompt_{m['prompt_group_idx']}"
+                    uid = f"verify_p{m['prompt_group_idx']}_c{hash(str(m['candidate_answer'])) % 100000}"
                     uids.append(uid)
                 batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
             else:
@@ -1863,19 +1863,28 @@ class RayPPOTrainer:
                                 old_log_prob_output = self.actor_rollout_wg.compute_log_prob(batch_second)
                                 batch_second.batch["old_log_probs"] = old_log_prob_output.batch["old_log_probs"]
                                 
-                                # 4. Compute GRPO advantages using prompt-group uid
+                                # 4. Compute GRPO advantages using candidate-level uid
                                 advantages, returns = compute_grpo_outcome_advantage(
                                     token_level_rewards=batch_second.batch["token_level_rewards"],
                                     response_mask=batch_second.batch["response_mask"],
                                     index=batch_second.non_tensor_batch["uid"]
                                 )
                                 
-                                # 5. Scale advantages by lambda_second immediately
-                                alpha = self.config.algorithm.get("lambda_second", 0.5)
-                                advantages = advantages * alpha
+                                # 5. Scale advantages by per-sample consistency as dynamic lambda
+                                # Build per-sample consistency weights from verification_mapping
+                                per_sample_consistency = np.zeros(len(batch_second), dtype=np.float32)
+                                for si, m in enumerate(verification_mapping):
+                                    g_idx = m["prompt_group_idx"]
+                                    per_sample_consistency[si] = consistency_scores.get(g_idx, 1.0)
+                                consistency_weights = torch.tensor(per_sample_consistency, dtype=advantages.dtype, device=advantages.device)
+                                # dynamic_lambda = consistency_per_sample
+                                dynamic_lambda = consistency_weights.unsqueeze(-1)
+                                advantages = advantages * dynamic_lambda
                                 batch_second.batch["advantages"] = advantages
                                 batch_second.batch["returns"] = returns
-                                batch_second.meta_info["lambda_second_applied"] = alpha
+                                batch_second.meta_info["lambda_second_applied"] = 1.0 # Global scaling is removed
+                                # Store per-sample consistency for downstream logging
+                                batch_second.non_tensor_batch["consistency_rate"] = per_sample_consistency
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
                     # balance the number of valid tokens on each dp rank.
