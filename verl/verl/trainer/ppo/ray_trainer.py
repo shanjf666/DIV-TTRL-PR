@@ -1871,9 +1871,9 @@ class RayPPOTrainer:
                                 )
                                 
                                 # 5. Scale advantages by per-sample consistency as dynamic lambda
-                                # Build per-sample consistency weights from verification_mapping
+                                # Build per-sample consistency weights from verify_mapping
                                 per_sample_consistency = np.zeros(len(batch_second), dtype=np.float32)
-                                for si, m in enumerate(verification_mapping):
+                                for si, m in enumerate(verify_mapping):
                                     g_idx = m["prompt_group_idx"]
                                     per_sample_consistency[si] = consistency_scores.get(g_idx, 1.0)
                                 consistency_weights = torch.tensor(per_sample_consistency, dtype=advantages.dtype, device=advantages.device)
