@@ -625,7 +625,7 @@ def select_final_pseudo_labels(
         true_set_candidates = [
             (ans, info["true_count"], info["frequency"])
             for ans, info in candidate_stats.items()
-            if info["true_count"] >= info["false_count"]
+            if info["true_count"] > info["false_count"]
         ]
 
         if true_set_candidates:
@@ -726,16 +726,16 @@ def compute_proxy_cm_reward(
             rewards.append(-1.0)
             format_error_count += 1
         elif is_pl and parsed_result is True:   # TP
-            rewards.append(1.0 * consistency)
+            rewards.append(1.0)
             tp_count += 1
         elif not is_pl and parsed_result is False: # TN
-            rewards.append(1.0 * consistency)
+            rewards.append(1.0)
             tn_count += 1
         elif is_pl and parsed_result is False:   # FN
-            rewards.append(-1.0 * consistency)
+            rewards.append(0.0)
             fn_count += 1
         elif not is_pl and parsed_result is True:  # FP
-            rewards.append(-0.5 * consistency)
+            rewards.append(0.0)
             fp_count += 1
             
     metrics = {

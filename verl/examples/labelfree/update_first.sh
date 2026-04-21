@@ -1,11 +1,12 @@
 #!/bin/bash
 """
-bash examples/labelfree/update_first.sh --backbone /root/autodl-tmp/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base --clip-high --ent 0.003
-python /root/autodl-tmp/DIV-TTRL/verl/scripts/model_merger.py \
+bash examples/labelfree/update_first_star_dapo.sh --backbone /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
+bash examples/labelfree/update_first_star.sh --backbone /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base --task MATH 2>&1 | tee train2_$(date +%Y%m%d_%H%M).log
+python scripts/model_merger.py \
     --backend fsdp \
-    --local_dir /root/autodl-tmp/model/TTRL-MATH500/MATH-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/220024/global_step_45/actor \
-    --hf_model_path /root/autodl-tmp/data/models/modelscope_cache/models/Qwen/Qwen3-4B-Base \
-    --target_dir /root/autodl-tmp/model/math_step_45_adaptive_passk
+    --local_dir /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/TTRL-MATH500/MATH-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/103850/global_step_30/actor \
+    --hf_model_path /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base \
+    --target_dir /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/math_step_30_prompt_normalized
 """
 export WANDB_ENTITY=2691454060-ucla
 export USE_API_SELF_VERIFY=0
@@ -107,7 +108,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Set default values
-TASK=${TASK:-"MATH"}
+TASK=${TASK:-"DAPO"}
 BACKBONE=${BACKBONE:-"Qwen3-4B-Base"}
 CLIP_HIGH=${CLIP_HIGH:-"false"}
 CLIP_SPECIFIED=${CLIP_SPECIFIED:-"false"}
@@ -142,7 +143,7 @@ echo "========================="
 
 DATE=$(date +%m%d)
 TIME_TAG=$(date +%H%M%S)
-# TIME_TAG=182434
+# TIME_TAG=104307
 
 ADVANTAGE="pass_grpo_penalized"
 
@@ -164,14 +165,14 @@ if [ "$K" -gt 13 ]; then
 else
   N=16
 fi
-
+  
 # Set EPISODE
-EPISODE=4
-DATA_TRAIN_BATCH_SIZE=16
+EPISODE=1
+DATA_TRAIN_BATCH_SIZE=32
 N_VOTES_PER_PROMPT=32 # Reduce candidates to balance computational overhead
 N_SAMPLES_PER_PROMPT=32 # Keep training sample count
 MINI_BATCH_SIZE=1 # Actual mini batch size is MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT - increase mini batch
-MICRO_BATCH_SIZE=2 # Increase micro batch to better utilize GPU
+MICRO_BATCH_SIZE=8 # Increase micro batch to better utilize GPU
 
 DATA_LOCAL_DIR="data"
 # Parse backbone model path and safe name (avoid directory names containing slashes)
@@ -238,7 +239,7 @@ EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 
 
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 
 
@@ -258,19 +259,16 @@ echo "Output directory: $OUTPUT_DIR"
 echo "Experiment name: $LOG_NAME"
 echo "==============================="
 
-  # reward_model.reward_manager=diversity_ttrl \
-  # reward_model.reward_kwargs.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
-  # reward_model.reward_kwargs.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
-  # reward_model.reward_kwargs.mode="train" \
-
-# # ------------------------------------------------------------
+# ============================================================
+# Start PPO Training
+# ============================================================
 python -m verl.trainer.main_ppo \
   reward_model.reward_manager=ttrl \
   reward_model.reward_kwargs.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   reward_model.reward_kwargs.n_votes_per_prompt=$N_VOTES_PER_PROMPT \
   reward_model.reward_kwargs.mode="train" \
   data.train_files=["$DATA_LOCAL_DIR/$TASK/train-simplerl.parquet"] \
-  data.val_files=["$DATA_LOCAL_DIR/$TASK/test-simplerl.parquet"] \
+  data.val_files=["$DATA_LOCAL_DIR/AIME-TTT/test-simplerl.parquet","$DATA_LOCAL_DIR/MATH-TTT/test-simplerl.parquet","$DATA_LOCAL_DIR/AMC-TTT/test-simplerl.parquet","$DATA_LOCAL_DIR/AIME25-TTT/test-simplerl.parquet"] \
   data.max_prompt_length=$MAX_PROMPT_LENGTH \
   data.max_response_length=$MAX_RESPONSE_LENGTH \
   data.train_batch_size=$DATA_TRAIN_BATCH_SIZE \
@@ -299,7 +297,7 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.free_cache_engine=False \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
-  actor_rollout_ref.rollout.gpu_memory_utilization=0.5 \
+  actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
   actor_rollout_ref.rollout.do_vote=True \
   actor_rollout_ref.rollout.n_vote=$N_VOTES_PER_PROMPT \
   actor_rollout_ref.rollout.n=$N_SAMPLES_PER_PROMPT \
@@ -316,22 +314,31 @@ python -m verl.trainer.main_ppo \
   critic.model.fsdp_config.param_offload=False \
   critic.model.fsdp_config.optimizer_offload=False \
   algorithm.kl_ctrl.kl_coef=0.00 \
+  algorithm.k=4 \
   algorithm.adv_estimator=$ADVANTAGE \
   +two_stage_verify=True \
-  +two_stage_mode=sampling \
+  +two_stage_mode='sampling' \
   +two_stage_n=8 \
-  +two_stage_micro_batch_size=16 \
+  +two_stage_micro_batch_size=32 \
   +two_stage_max_new_tokens=2048 \
-  +two_stage_max_candidates=5 \
-  algorithm.k=4 \
+  +two_stage_temperature=0.6 \
+  +two_stage_top_p=0.85 \
+  +two_stage_hc_temperature=1.0 \
+  +two_stage_lc_temperature=0.6 \
+  +two_stage_max_candidates=10 \
+  +two_stage_hc_max_candidates=5 \
+  +two_stage_lc_max_candidates=10 \
+  +two_stage_fallback='majority' \
+  +two_stage_fallback_mode='no_update_both' \
   +algorithm.lambda_second=0.5 \
   +algorithm.lam_div=0.05 \
   +algorithm.c_max=2 \
-  +algorithm.div_sc_threshold=0.5 \
+  +algorithm.mode='static' \
+  +algorithm.div_sc_threshold=0.6 \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=8 \
+  trainer.n_gpus_per_node=4 \
   trainer.nnodes=1 \
   trainer.save_freq=15 \
   trainer.test_freq=5 \
