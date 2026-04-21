@@ -328,6 +328,7 @@ python -m verl.trainer.main_ppo \
   +two_stage_max_candidates=10 \
   +two_stage_hc_max_candidates=5 \
   +two_stage_lc_max_candidates=10 \
+  +two_stage_high_consistency_topk_padding=True \
   +two_stage_fallback='majority' \
   +two_stage_fallback_mode='no_update_both' \
   +algorithm.lambda_second=0.5 \

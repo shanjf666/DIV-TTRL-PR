@@ -732,10 +732,10 @@ def compute_proxy_cm_reward(
             rewards.append(1.0)
             tn_count += 1
         elif is_pl and parsed_result is False:   # FN
-            rewards.append(0.0)
+            rewards.append(-0.3)
             fn_count += 1
         elif not is_pl and parsed_result is True:  # FP
-            rewards.append(0.0)
+            rewards.append(-0.8)
             fp_count += 1
             
     metrics = {

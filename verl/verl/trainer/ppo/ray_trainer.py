@@ -1402,11 +1402,11 @@ class RayPPOTrainer:
                 batch_second = batch_second_unordered[reorder_indices]
                 
                 # Setup UIDs for GRPO grouping.
-                # Each candidate answer gets its own UID so second-stage
-                # normalization happens at the candidate level.
+                # All samples for the same prompt share a UID so second-stage
+                # normalization happens at the prompt-group level.
                 uids = []
                 for m in verification_mapping:
-                    uid = f"verify_p{m['prompt_group_idx']}_c{hash(str(m['candidate_answer'])) % 100000}"
+                    uid = f"verify_prompt_{m['prompt_group_idx']}"
                     uids.append(uid)
                 batch_second.non_tensor_batch["uid"] = np.array(uids, dtype=object)
             else:
