@@ -433,14 +433,13 @@ def compute_pass_grpo_penalized_advantage(
                 for local_i, global_i in enumerate(sample_indices):
                     if answers[local_i] == 0:
                         l_i = int(actual_lengths_cpu[global_i])
-                        if l_i < 0.85 * length_max:
-                            div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
-                            reward_div = current_lam_div * min(div_val, c_max)
-                            group_r_div[local_i] = reward_div
-                        
-                            if reward_div > 0:
-                                total_r_div += reward_div
-                                r_div_count += 1
+                        div_val = abs(l_i - mu_l) / (sigma_l + 1e-5)
+                        reward_div = current_lam_div * min(div_val, c_max)
+                        group_r_div[local_i] = reward_div
+                    
+                        if reward_div > 0:
+                            total_r_div += reward_div
+                            r_div_count += 1
     
             for local_i, global_i in enumerate(sample_indices):
                 a_pass_k = a_pos if answers[local_i] == 0 else a_neg
