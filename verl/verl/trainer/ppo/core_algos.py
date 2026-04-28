@@ -420,7 +420,7 @@ def compute_pass_grpo_penalized_advantage(
             for local_i, global_i in enumerate(sample_indices):
                 if answers[local_i] == 0:
                     correct_lengths.append(int(actual_lengths_cpu[global_i]))
-                    
+
             if sc_ratio > div_sc_threshold and len(correct_lengths) > 0:
                 mu_l = sum(correct_lengths) / len(correct_lengths)
                 var_l = sum((x - mu_l)**2 for x in correct_lengths) / len(correct_lengths)

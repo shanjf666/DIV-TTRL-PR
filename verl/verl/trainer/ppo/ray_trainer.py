@@ -2115,6 +2115,75 @@ class RayPPOTrainer:
                             if pp_key in batch.meta_info:
                                 metrics[f"train/{pp_key.replace('/', '_')}"] = float(batch.meta_info[pp_key])
 
+                        # === Length & Pass@K Training Diagnostics ===
+                        if self.use_ttrl:
+                            resp_lengths = batch.batch["response_mask"].sum(dim=-1).float().cpu()
+
+                            # Length by majority / non-majority (pseudo-label based)
+                            if "answer_types" in batch.non_tensor_batch:
+                                at = np.array(batch.non_tensor_batch["answer_types"])
+                                maj_mask = (at == 0)
+                                if maj_mask.any():
+                                    ml = resp_lengths[maj_mask]
+                                    metrics["train/length_majority_mean"] = ml.mean().item()
+                                    metrics["train/length_majority_std"] = ml.std().item() if len(ml) > 1 else 0.0
+                                if (~maj_mask).any():
+                                    nml = resp_lengths[~maj_mask]
+                                    metrics["train/length_non_majority_mean"] = nml.mean().item()
+                                    metrics["train/length_non_majority_std"] = nml.std().item() if len(nml) > 1 else 0.0
+
+                            # Length by correct / incorrect (GT-based, when available)
+                            if "oracle_answer_types" in batch.non_tensor_batch:
+                                oat = np.array(batch.non_tensor_batch["oracle_answer_types"])
+                                correct_mask = (oat == 0)
+                                if correct_mask.any():
+                                    cl = resp_lengths[correct_mask]
+                                    metrics["train/length_correct_mean"] = cl.mean().item()
+                                    metrics["train/length_correct_std"] = cl.std().item() if len(cl) > 1 else 0.0
+                                if (~correct_mask).any():
+                                    il = resp_lengths[~correct_mask]
+                                    metrics["train/length_incorrect_mean"] = il.mean().item()
+                                    metrics["train/length_incorrect_std"] = il.std().item() if len(il) > 1 else 0.0
+
+                            # Training Pass@K (pseudo-label based)
+                            from math import comb as math_comb
+                            uids = batch.non_tensor_batch["uid"]
+                            scores_sum = batch.batch["token_level_scores"].sum(dim=-1).cpu()
+                            unique_uids = list(dict.fromkeys(uids))  # preserve order, deduplicate
+
+                            for k_val in [1, 4, 16]:
+                                pass_at_k_list = []
+                                for uid in unique_uids:
+                                    group_mask = np.array([u == uid for u in uids])
+                                    group_scores = scores_sum[group_mask]
+                                    n = len(group_scores)
+                                    c = int((group_scores > 0).sum().item())
+                                    if n >= k_val and math_comb(n, k_val) > 0:
+                                        p = 1.0 - math_comb(n - c, k_val) / math_comb(n, k_val)
+                                    else:
+                                        p = float(c > 0)
+                                    pass_at_k_list.append(p)
+                                if pass_at_k_list:
+                                    metrics[f"train/pass@{k_val}"] = float(np.mean(pass_at_k_list))
+
+                            # Oracle Pass@K (GT-based, when available)
+                            if "oracle_answer_types" in batch.non_tensor_batch:
+                                oat = np.array(batch.non_tensor_batch["oracle_answer_types"])
+                                for k_val in [1, 4, 16]:
+                                    oracle_pass_list = []
+                                    for uid in unique_uids:
+                                        group_mask = np.array([u == uid for u in uids])
+                                        group_oat = oat[group_mask]
+                                        n = len(group_oat)
+                                        c = int((group_oat == 0).sum())
+                                        if n >= k_val and math_comb(n, k_val) > 0:
+                                            p = 1.0 - math_comb(n - c, k_val) / math_comb(n, k_val)
+                                        else:
+                                            p = float(c > 0)
+                                        oracle_pass_list.append(p)
+                                    if oracle_pass_list:
+                                        metrics[f"train/pass@{k_val}_oracle"] = float(np.mean(oracle_pass_list))
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
