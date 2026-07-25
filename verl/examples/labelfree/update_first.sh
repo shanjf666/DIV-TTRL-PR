@@ -1,5 +1,5 @@
 #!/bin/bash
-"""
+: <<'EXAMPLE_COMMANDS'
 bash examples/labelfree/update_first_star_dapo.sh --backbone /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base 2>&1 | tee train_$(date +%Y%m%d_%H%M).log
 bash examples/labelfree/update_first_star.sh --backbone /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base --task MATH 2>&1 | tee train2_$(date +%Y%m%d_%H%M).log
 python scripts/model_merger.py \
@@ -7,7 +7,7 @@ python scripts/model_merger.py \
     --local_dir /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/TTRL-MATH500/MATH-TTT-Qwen3-4B-Base/diversity-RL-Ent0.000/103850/global_step_30/actor \
     --hf_model_path /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/modelscope_cache/models/Qwen/Qwen3-4B-Base \
     --target_dir /HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/math_step_30_prompt_normalized
-"""
+EXAMPLE_COMMANDS
 export WANDB_ENTITY=2691454060-ucla
 export USE_API_SELF_VERIFY=0
 # === TTRL Training Script ===
@@ -40,6 +40,13 @@ export USE_API_SELF_VERIFY=0
 #export VLLM_ATTENTION_BACKEND=XFORMERS
 unset VLLM_ATTENTION_BACKEND
 export VLLM_USE_V1=1
+export NCCL_P2P_DISABLE=0
+export NCCL_P2P_LEVEL=PHB
+export NCCL_SHM_DISABLE=0
+export NCCL_IB_DISABLE=1
+export NCCL_CUMEM_ENABLE=0
+export NCCL_CUMEM_HOST_ENABLE=0
+unset PYTORCH_CUDA_ALLOC_CONF
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -109,7 +116,7 @@ done
 
 # Set default values
 TASK=${TASK:-"DAPO"}
-BACKBONE=${BACKBONE:-"Qwen3-4B-Base"}
+BACKBONE=${BACKBONE:-"Qwen-4B-base"}
 CLIP_HIGH=${CLIP_HIGH:-"false"}
 CLIP_SPECIFIED=${CLIP_SPECIFIED:-"false"}
 CLIP_VALUE=${CLIP_VALUE:-""}
@@ -168,11 +175,14 @@ fi
   
 # Set EPISODE
 EPISODE=1
-DATA_TRAIN_BATCH_SIZE=32
+NUM_GPUS=${NUM_GPUS:-8}
+DATA_TRAIN_BATCH_SIZE=${DATA_TRAIN_BATCH_SIZE:-32}
 N_VOTES_PER_PROMPT=32 # Reduce candidates to balance computational overhead
 N_SAMPLES_PER_PROMPT=32 # Keep training sample count
 MINI_BATCH_SIZE=1 # Actual mini batch size is MINI_BATCH_SIZE * N_SAMPLES_PER_PROMPT - increase mini batch
-MICRO_BATCH_SIZE=8 # Increase micro batch to better utilize GPU
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-4}
+LOG_PROB_MICRO_BATCH_SIZE=${LOG_PROB_MICRO_BATCH_SIZE:-16}
+TWO_STAGE_MICRO_BATCH_SIZE=${TWO_STAGE_MICRO_BATCH_SIZE:-64}
 
 DATA_LOCAL_DIR="data"
 # Parse backbone model path and safe name (avoid directory names containing slashes)
@@ -181,7 +191,7 @@ if [[ "$BACKBONE" == *"/"* ]]; then
   BACKBONE_PATH="$BACKBONE"
   BACKBONE_NAME="${BACKBONE##*/}"
 else
-  BACKBONE_PATH="/root/autodl-tmp/model/${BACKBONE}"
+  BACKBONE_PATH="/root/autodl-fs/${BACKBONE}"
   BACKBONE_NAME="$BACKBONE"
 fi
 
@@ -239,7 +249,7 @@ EXPERIMENT="${EXPERIMENT}-Ent${ENTROPY_COEFF}"
 
 
 LOG_NAME="${EXPERIMENT}-${MODEL}"
-OUTPUT_DIR="/HOME/sysu_jlou/sysu_jlou_jianfeng/HDD_POOL/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
+OUTPUT_DIR="/root/autodl-tmp/model/${WANDB_PROJECT}/${MODEL}/${EXPERIMENT}/${TIME_TAG}"
 
 
 
@@ -284,18 +294,19 @@ python -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.clip_ratio_high=$CLIP_RATIO_HIGH \
   actor_rollout_ref.actor.optim.lr=5e-7 \
   actor_rollout_ref.actor.entropy_coeff=$ENTROPY_COEFF \
+  +actor_rollout_ref.actor.compute_topk_metrics=False \
   actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
   actor_rollout_ref.actor.optim.warmup_style='cosine' \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu=$((MAX_TOKEN_LEN2)) \
-  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
-  actor_rollout_ref.ref.fsdp_config.param_offload=True \
+  actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
+  actor_rollout_ref.ref.fsdp_config.param_offload=False \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.temperature=$TEMP \
   actor_rollout_ref.rollout.enforce_eager=False \
   actor_rollout_ref.rollout.free_cache_engine=False \
-  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$MICRO_BATCH_SIZE \
+  actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=$LOG_PROB_MICRO_BATCH_SIZE \
   actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
   actor_rollout_ref.rollout.gpu_memory_utilization=0.65 \
   actor_rollout_ref.rollout.do_vote=True \
@@ -319,16 +330,16 @@ python -m verl.trainer.main_ppo \
   +two_stage_verify=True \
   +two_stage_mode='sampling' \
   +two_stage_n=8 \
-  +two_stage_micro_batch_size=32 \
+  +two_stage_micro_batch_size=$TWO_STAGE_MICRO_BATCH_SIZE \
   +two_stage_max_new_tokens=2048 \
   +two_stage_temperature=0.6 \
   +two_stage_top_p=0.85 \
   +two_stage_hc_temperature=1.0 \
   +two_stage_lc_temperature=0.6 \
   +two_stage_max_candidates=10 \
-  +two_stage_hc_max_candidates=5 \
-  +two_stage_lc_max_candidates=10 \
-  +two_stage_high_consistency_topk_padding=True \
+  +two_stage_hc_max_candidates=3 \
+  +two_stage_lc_max_candidates=5 \
+  two_stage_high_consistency_topk_padding=False \
   +two_stage_fallback='majority' \
   +two_stage_fallback_mode='no_update_both' \
   +algorithm.lambda_second=0.5 \
@@ -339,7 +350,7 @@ python -m verl.trainer.main_ppo \
   trainer.logger=['console','wandb'] \
   trainer.project_name=$WANDB_PROJECT \
   trainer.experiment_name=$LOG_NAME \
-  trainer.n_gpus_per_node=4 \
+  trainer.n_gpus_per_node=$NUM_GPUS \
   trainer.nnodes=1 \
   trainer.save_freq=15 \
   trainer.test_freq=5 \
@@ -348,6 +359,11 @@ python -m verl.trainer.main_ppo \
   trainer.default_local_dir=$OUTPUT_DIR \
   trainer.total_epochs=$EPISODE "$@"
 
+TRAINING_STATUS=$?
+if [ "$TRAINING_STATUS" -ne 0 ]; then
+  echo "=== Training Failed (exit code: $TRAINING_STATUS) ===" >&2
+  exit "$TRAINING_STATUS"
+fi
 echo "=== Training Completed ==="
 echo "Output directory: $OUTPUT_DIR"
 echo "Project name: $WANDB_PROJECT"

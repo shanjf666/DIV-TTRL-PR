@@ -86,7 +86,10 @@ class ActorRolloutRefWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group()
+            torch.distributed.init_process_group(
+                backend="nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
         # build device mesh for FSDP
         world_size = torch.distributed.get_world_size()
@@ -138,6 +141,17 @@ class ActorRolloutRefWorker(Worker):
                 )
                 assert self.config.actor.ppo_mini_batch_size // self.config.actor.ppo_micro_batch_size_per_gpu > 0, (
                     f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than ppo_micro_batch_size_per_gpu {self.config.actor.ppo_micro_batch_size_per_gpu}"
+                )
+
+            elif self.config.actor.ppo_micro_batch_size_per_gpu is not None:
+                micro_bsz = self.config.actor.ppo_micro_batch_size_per_gpu
+                assert self.config.actor.ppo_mini_batch_size % micro_bsz == 0, (
+                    f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} "
+                    f"must be divisible by ppo_micro_batch_size_per_gpu {micro_bsz}"
+                )
+                assert self.config.actor.ppo_mini_batch_size >= micro_bsz, (
+                    f"normalized ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} "
+                    f"must be >= ppo_micro_batch_size_per_gpu {micro_bsz}"
                 )
 
         # normalize rollout config
@@ -238,7 +252,7 @@ class ActorRolloutRefWorker(Worker):
 
             if enable_gradient_checkpointing:
                 actor_module.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
 
         if self.rank == 0:
             print_model_size(actor_module)
@@ -269,10 +283,9 @@ class ActorRolloutRefWorker(Worker):
         fsdp_mesh = self.device_mesh
         sharding_strategy = get_sharding_strategy(fsdp_mesh)
 
-        # TODO: add transformer policy
-        # We force reference policy to use CPUOffload to save memory.
-        # We force turn off CPUOffload for actor because it causes incorrect results when using grad accumulation
-        cpu_offload = None if role == "actor" else CPUOffload(offload_params=True)
+        # Honor the configured policy. Keeping the reference model on GPU avoids
+        # repeated PCIe transfers during reference log-prob computation.
+        cpu_offload = CPUOffload(offload_params=True) if fsdp_config.get("param_offload", False) else None
         actor_module_fsdp = FSDP(
             actor_module,
             cpu_offload=cpu_offload,
@@ -691,7 +704,7 @@ class ActorRolloutRefWorker(Worker):
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.actor_module_fsdp)
 
@@ -717,7 +730,10 @@ class CriticWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
@@ -997,7 +1013,7 @@ class CriticWorker(Worker):
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
 
@@ -1012,7 +1028,7 @@ class CriticWorker(Worker):
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )
 
-        torch.distributed.barrier()
+        torch.distributed.barrier(device_ids=[torch.cuda.current_device()])
         if self._is_offload_param:
             offload_fsdp_model_to_cpu(self.critic_module)
 
@@ -1031,7 +1047,10 @@ class RewardModelWorker(Worker):
         import torch.distributed
 
         if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend="nccl")
+            torch.distributed.init_process_group(
+                backend="nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
         self.config = config
 
         # build device mesh for Ulysses Sequence Parallel
