@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -264,6 +265,16 @@ class RayWorkerGroup(WorkerGroup):
                     "RAY_LOCAL_WORLD_SIZE": str(local_world_size),
                     "RAY_LOCAL_RANK": str(local_rank),
                 }
+                for env_name in (
+                    "NCCL_P2P_DISABLE",
+                    "NCCL_P2P_LEVEL",
+                    "NCCL_SHM_DISABLE",
+                    "NCCL_IB_DISABLE",
+                    "NCCL_CUMEM_ENABLE",
+                    "NCCL_CUMEM_HOST_ENABLE",
+                ):
+                    if env_name in os.environ:
+                        env_vars[env_name] = os.environ[env_name]
                 if rank != 0:
                     env_vars["MASTER_ADDR"] = self._master_addr
                     env_vars["MASTER_PORT"] = self._master_port
